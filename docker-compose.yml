@@ -1,0 +1,14 @@
+services:
+  ai-robot:
+    build: .
+    container_name: ai-robot
+    ports:
+      - "8000:8000"
+    environment:
+      ROBOT_HOST: 0.0.0.0
+      ROBOT_PORT: 8000
+      ROBOT_DEBUG: 1
+    volumes:
+      - ./logs:/app/logs
+      - ./captures:/app/captures
+    restart: unless-stopped

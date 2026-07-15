@@ -1,0 +1,19 @@
+[Unit]
+Description=AI Robot Backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/meka/AI_Robot
+ExecStart=/home/meka/AI_Robot/start.sh
+Restart=always
+RestartSec=5
+User=meka
+Environment=ROBOT_HOST=0.0.0.0
+Environment=ROBOT_PORT=8000
+Environment=ROBOT_DEBUG=1
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
