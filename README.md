@@ -5,7 +5,6 @@ A modular, production-oriented backend for an autonomous robot running on Raspbe
 ## Architecture
 
 - Clean Architecture with dependency injection-friendly service boundaries
-- OOP design with asyncio-friendly concurrency
 - STM32 UART integration for actuation
 - Camera, LiDAR, LLM, voice, networking, and planning modules
 
