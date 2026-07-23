@@ -6,18 +6,21 @@ import asyncio
 import time
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from ai.assistant import RobotAssistant
 from ai.llm import LLMService
 from ai.planner import Planner
 from camera.camera import Camera
 from camera.stream import CameraStream
+from camera.vision import VisionService
 from config import RobotConfig
 from lidar.lidar import LidarSensor
 from network.api import router as api_router
 from network.websocket import RobotSocketManager
 from robot.stm32 import STM32Controller
-from robot.status import RobotStatus
+from robot.status import RobotMode, RobotStatus
+from safety.fire_monitor import FireMonitor
 from slam.slam import SimpleSlam
 from utils.alerts import AlertManager
 from utils.event_log import EventLogger
@@ -32,11 +35,13 @@ def create_app(config: RobotConfig) -> FastAPI:
     configure_logging(config)
 
     app = FastAPI(title=config.app_name, version="0.1.0")
+    app.mount("/app", StaticFiles(directory="app", html=True), name="robot_app")
 
     stm32 = STM32Controller(config)
     camera = Camera(config)
     lidar = LidarSensor(config)
     llm = LLMService(config)
+    vision = VisionService(config.supported_objects, llm=llm)
     planner = Planner(stm32)
     assistant = RobotAssistant(llm=llm, planner=planner, camera=camera, lidar=lidar, stm32=stm32)
     stream = CameraStream(camera)
@@ -50,15 +55,29 @@ def create_app(config: RobotConfig) -> FastAPI:
     app.state.camera = camera
     app.state.lidar = lidar
     app.state.llm = llm
+    app.state.vision = vision
     app.state.planner = planner
     app.state.assistant = assistant
     app.state.stream = stream
     app.state.socket_manager = socket_manager
     app.state.status = RobotStatus()
+    if config.autostart_autonomous:
+        app.state.status.set_mode(RobotMode.AUTONOMOUS)
+        app.state.status.mission = "autonomous_ready"
+        app.state.status.ai_state = "autonomous_standby"
     app.state.started_at = time.time()
     app.state.event_logger = event_logger
     app.state.alert_manager = alert_manager
     app.state.slam = slam
+    fire_monitor = FireMonitor(
+        camera=camera,
+        vision=vision,
+        stm32=stm32,
+        status=app.state.status,
+        interval=config.fire_monitor_interval,
+    )
+    app.state.fire_monitor = fire_monitor
+    app.state.fire_monitor_task = None
     stm32.initialize()
     camera.initialize()
     lidar.initialize()
@@ -101,6 +120,16 @@ def create_app(config: RobotConfig) -> FastAPI:
     @app.on_event("startup")
     async def start_status_stream() -> None:
         asyncio.create_task(_emit_status_loop())
+        if config.fire_monitor_enabled and config.gemini_api_key:
+            app.state.fire_monitor_task = asyncio.create_task(fire_monitor.run())
+            logger.info("Gemini fire monitor enabled on camera index %s", config.camera_index)
+
+    @app.on_event("shutdown")
+    async def stop_fire_monitor() -> None:
+        task = getattr(app.state, "fire_monitor_task", None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket) -> None:

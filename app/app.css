@@ -1,0 +1,58 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@500;600;700;800&display=swap');
+
+:root {
+  --ink: #e7f0ed;
+  --muted: #91a39e;
+  --line: rgba(206, 239, 227, .13);
+  --panel: rgba(24, 32, 32, .78);
+  --accent: #d4fb7c;
+  --accent-strong: #baf05e;
+  --alert: #ff806b;
+  --bg: #101416;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-width: 320px;
+  color: var(--ink);
+  background: radial-gradient(circle at 12% 4%, #26382f 0, transparent 32%), linear-gradient(145deg, #101416 0%, #131d1e 58%, #0c1112 100%);
+  font-family: 'Manrope', sans-serif;
+}
+button { font: inherit; color: inherit; cursor: pointer; }
+.shell { width: min(100% - 32px, 620px); margin: 0 auto; padding: 28px 0 44px; }
+.topbar, .panel-heading, .command-value, .connection { display: flex; align-items: center; }
+.topbar { justify-content: space-between; margin-bottom: 22px; }
+.eyebrow { margin: 0 0 8px; color: var(--accent); font: 500 11px 'DM Mono', monospace; letter-spacing: 0; }
+h1, h2, p { margin: 0; }
+h1 { font-size: clamp(26px, 7vw, 40px); line-height: 1.05; letter-spacing: 0; }
+h2 { font-size: 14px; letter-spacing: 0; }
+.connection { gap: 7px; color: var(--muted); font: 500 11px 'DM Mono', monospace; text-transform: uppercase; }
+.connection::before { width: 7px; height: 7px; border-radius: 50%; content: ''; background: var(--alert); }
+.connection.online::before { background: var(--accent); }
+.hero-panel, .command-panel, .telemetry-panel { border: 1px solid var(--line); background: var(--panel); backdrop-filter: blur(16px); }
+.hero-panel { min-height: 430px; padding: 52px 24px 30px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+.signal-ring { display: grid; place-items: center; width: 76px; height: 76px; margin-bottom: 23px; border: 1px solid rgba(212, 251, 124, .4); border-radius: 50%; box-shadow: 0 0 0 13px rgba(212, 251, 124, .04), 0 0 54px rgba(212, 251, 124, .1); }
+#signal-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--accent); }
+.listening .signal-ring { animation: pulse 1.35s ease-in-out infinite; }
+.status-label { color: var(--accent); font-size: 13px; font-weight: 700; }
+.transcript { min-height: 62px; max-width: 430px; padding: 15px 0 9px; color: var(--ink); font-size: 19px; line-height: 1.45; }
+.talk-button { display: grid; place-items: center; gap: 8px; width: min(100%, 260px); min-height: 82px; margin-top: 20px; border: 0; border-radius: 2px; background: var(--accent); color: #142016; box-shadow: 0 13px 32px rgba(212, 251, 124, .14); transition: transform .15s ease, background .15s ease; }
+.talk-button:active, .listening .talk-button { transform: translateY(2px); background: var(--accent-strong); }
+.mic-mark { font: 500 15px 'DM Mono', monospace; }
+.talk-label { font-size: 14px; font-weight: 800; }
+.hint { margin-top: 15px; color: var(--muted); font-size: 11px; }
+.command-panel, .telemetry-panel { margin-top: 12px; padding: 19px 20px; }
+.panel-heading { justify-content: space-between; gap: 12px; }
+.command-value { justify-content: space-between; gap: 16px; padding-top: 18px; }
+#intent { color: var(--accent); font: 500 20px 'DM Mono', monospace; }
+#target { color: var(--muted); font-size: 12px; text-align: right; }
+.stop-button { padding: 8px 10px; border: 1px solid rgba(255, 128, 107, .5); border-radius: 0; background: transparent; color: var(--alert); font-size: 11px; font-weight: 800; }
+.icon-button { padding: 0; border: 0; background: transparent; color: var(--accent); font: 500 11px 'DM Mono', monospace; }
+.telemetry-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; margin-top: 17px; background: var(--line); }
+.telemetry-grid div { min-height: 72px; padding: 13px; background: #172020; }
+.telemetry-grid span { display: block; margin-bottom: 7px; color: var(--muted); font: 500 10px 'DM Mono', monospace; text-transform: uppercase; }
+.telemetry-grid strong { font-size: 14px; overflow-wrap: anywhere; }
+.error { min-height: 20px; padding-top: 14px; color: var(--alert); font-size: 12px; text-align: center; }
+@keyframes pulse { 50% { transform: scale(1.08); box-shadow: 0 0 0 21px rgba(212, 251, 124, .02), 0 0 70px rgba(212, 251, 124, .2); } }
+@media (max-width: 420px) { .shell { width: min(100% - 22px, 620px); padding-top: 19px; } .hero-panel { min-height: 405px; padding-inline: 16px; } }

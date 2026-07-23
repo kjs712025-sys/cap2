@@ -33,6 +33,7 @@ class STM32Controller:
         self.serial: Optional[serial.Serial] = None
         self.status = STM32Status()
         self._receive_buffer = ""
+        self.emergency_latched = False
 
     def connect(self) -> None:
         """Open the UART connection if possible."""
@@ -100,6 +101,9 @@ class STM32Controller:
 
     def send_velocity(self, command: VelocityCommand) -> None:
         """Send a velocity command to the STM32."""
+        if self.emergency_latched and any((command.vx, command.vy, command.wz)):
+            logger.warning("Emergency stop latched; blocking velocity command: %s", command)
+            return
         if not self.serial or not self.serial.is_open:
             self.connect()
         if not self.serial or not self.serial.is_open:
@@ -112,8 +116,14 @@ class STM32Controller:
 
     def emergency_stop(self) -> None:
         """Command the robot to stop immediately."""
+        self.emergency_latched = True
         self.send_velocity(VelocityCommand(0.0, 0.0, 0.0))
         logger.warning("Emergency stop triggered")
+
+    def clear_emergency_stop(self) -> None:
+        """Release the emergency latch after an operator safety check."""
+        self.emergency_latched = False
+        logger.info("Emergency stop latch cleared")
 
     async def heartbeat_loop(self) -> None:
         """Send periodic heartbeat updates while connected."""

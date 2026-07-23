@@ -34,7 +34,7 @@ class RobotAssistant:
         self.camera = camera
         self.lidar = lidar
         self.stm32 = stm32
-        self.speech_recognizer = speech_recognizer or SpeechRecognizer()
+        self.speech_recognizer = speech_recognizer or SpeechRecognizer(llm=llm)
         self.tts = tts or TextToSpeech()
 
     async def handle_user_command(self, text: str) -> dict[str, Any]:
@@ -44,7 +44,11 @@ class RobotAssistant:
         self.tts.speak(f"Executing {intent.get('intent', 'command')}")
         return intent
 
-    async def handle_voice_command(self, audio_data: Any) -> dict[str, Any]:
+    async def handle_voice_command(
+        self,
+        audio_data: Any,
+        mime_type: str = "audio/wav",
+    ) -> dict[str, Any]:
         """Transcribe an audio payload and route it through the same command handler."""
-        text = await self.speech_recognizer.transcribe(audio_data)
+        text = await self.speech_recognizer.transcribe(audio_data, mime_type=mime_type)
         return await self.handle_user_command(text)

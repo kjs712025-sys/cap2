@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101416">
+  <title>OmniBot Control</title>
+  <link rel="stylesheet" href="/app/app.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">OMNIBOT / CONTROL</p>
+        <h1>Robot command</h1>
+      </div>
+      <span id="connection" class="connection offline">Offline</span>
+    </header>
+
+    <section class="hero-panel" aria-live="polite">
+      <div class="signal-ring"><span id="signal-dot"></span></div>
+      <p id="status-label" class="status-label">Ready to listen</p>
+      <p id="transcript" class="transcript">Press and hold to speak</p>
+      <button id="talk-button" class="talk-button" type="button" aria-label="Press and hold to speak">
+        <span class="mic-mark">MIC</span>
+        <span class="talk-label">Hold to talk</span>
+      </button>
+      <p class="hint">Release to send your command</p>
+    </section>
+
+    <section class="command-panel">
+      <div class="panel-heading">
+        <h2>Latest command</h2>
+        <button id="stop-button" class="stop-button" type="button">Emergency stop</button>
+      </div>
+      <div class="command-value">
+        <span id="intent">--</span>
+        <span id="target">Waiting for input</span>
+      </div>
+    </section>
+
+    <section class="telemetry-panel">
+      <div class="panel-heading"><h2>Robot status</h2><button id="refresh-button" class="icon-button" type="button" aria-label="Refresh status">Refresh</button></div>
+      <div class="telemetry-grid">
+        <div><span>Mode</span><strong id="mode">--</strong></div>
+        <div><span>Mission</span><strong id="mission">--</strong></div>
+        <div><span>Speed</span><strong id="speed">--</strong></div>
+        <div><span>AI state</span><strong id="ai-state">--</strong></div>
+      </div>
+    </section>
+
+    <p id="error" class="error" role="alert"></p>
+  </main>
+  <script src="/app/app.js"></script>
+</body>
+</html>

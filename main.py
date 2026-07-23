@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uvicorn
+from dotenv import load_dotenv
 
 from config import RobotConfig
 from network.server import create_app
@@ -26,6 +27,7 @@ class RobotBackend:
 
 def main() -> None:
     """Launch the robot backend."""
+    load_dotenv()
     backend = RobotBackend()
     backend.run()
 

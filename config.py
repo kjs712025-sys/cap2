@@ -16,19 +16,25 @@ class RobotConfig:
     log_level: str = "INFO"
     log_file: str = "logs/robot.log"
 
-    uart_port: str = "/dev/ttyAMA0"
+    uart_port: str = "/dev/serial0"
     uart_baudrate: int = 115200
     uart_timeout: float = 0.5
 
     camera_source: str = "usb"
     camera_index: int = 0
     preview_enabled: bool = True
+    fire_monitor_enabled: bool = True
+    fire_monitor_interval: float = 2.0
+    autostart_autonomous: bool = True
 
     lidar_port: str = "/dev/ttyUSB0"
     lidar_model: str = "ydlidar_x4"
 
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-4o-mini"
+    gemini_api_key: Optional[str] = None
+    gemini_model: str = "gemini-2.0-flash"
+    gemini_api_url: str = "https://gemini.googleapis.com/v1/models/{model}:generate"
     llm_enabled: bool = False
 
     host: str = "0.0.0.0"
@@ -66,10 +72,19 @@ class RobotConfig:
             camera_source=os.getenv("ROBOT_CAMERA_SOURCE", cls.camera_source),
             camera_index=int(os.getenv("ROBOT_CAMERA_INDEX", cls.camera_index)),
             preview_enabled=os.getenv("ROBOT_PREVIEW_ENABLED", "1") == "1",
+            fire_monitor_enabled=os.getenv("ROBOT_FIRE_MONITOR_ENABLED", "1") == "1",
+            fire_monitor_interval=float(os.getenv("ROBOT_FIRE_MONITOR_INTERVAL", cls.fire_monitor_interval)),
+            autostart_autonomous=os.getenv("ROBOT_AUTOSTART_AUTONOMOUS", "1") == "1",
             lidar_port=os.getenv("ROBOT_LIDAR_PORT", cls.lidar_port),
             lidar_model=os.getenv("ROBOT_LIDAR_MODEL", cls.lidar_model),
             openai_api_key=os.getenv("OPENAI_API_KEY"),
             openai_model=os.getenv("OPENAI_MODEL", cls.openai_model),
+            gemini_api_key=os.getenv("GEMINI_API_KEY"),
+            gemini_model=os.getenv("GEMINI_MODEL", cls.gemini_model),
+            gemini_api_url=os.environ.get(
+                "GEMINI_API_URL",
+                "https://gemini.googleapis.com/v1/models/{model}:generate",
+            ),
             llm_enabled=os.getenv("ROBOT_LLM_ENABLED", "0") == "1",
             host=os.getenv("ROBOT_HOST", cls.host),
             port=int(os.getenv("ROBOT_PORT", cls.port)),

@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import json
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -68,6 +73,12 @@ class LLMService:
 
     async def infer_intent(self, user_text: str) -> dict[str, Any]:
         """Infer the intended action from user text."""
+        if self.config.gemini_api_key:
+            try:
+                return await self._infer_with_gemini(user_text)
+            except Exception as exc:  # pragma: no cover - network-dependent path
+                logger.exception("Gemini inference failed: %s", exc)
+
         if not self.client:
             self.connect()
         if not self.client:
@@ -81,3 +92,99 @@ class LLMService:
         self.memory.add(LLMMessage(role="user", content=user_text))
         logger.info("LLM inference requested")
         return {"intent": "navigate", "target": "front_door", "message": user_text}
+
+    async def _infer_with_gemini(self, user_text: str) -> dict[str, Any]:
+        """Call Gemini's generate endpoint and parse its JSON intent."""
+        prompt = (
+            f"{self.build_system_prompt()} Return only valid JSON with keys "
+            "intent, target, and message. User command: " + user_text
+        )
+        response = await self._generate_with_gemini(
+            [{"text": prompt}],
+            response_json=True,
+        )
+        result = json.loads(response)
+        result.setdefault("message", user_text)
+        self.memory.add(LLMMessage(role="user", content=user_text))
+        return result
+
+    async def transcribe_audio(self, audio_data: bytes, mime_type: str = "audio/wav") -> str:
+        """Transcribe audio with Gemini's multimodal input support."""
+        if not self.config.gemini_api_key:
+            return ""
+        response = await self._generate_with_gemini(
+            [
+                {"text": "Transcribe this audio. Return only the spoken words."},
+                {
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": base64.b64encode(audio_data).decode("ascii"),
+                    }
+                },
+            ]
+        )
+        return response.strip()
+
+    async def analyze_image(
+        self,
+        image_data: bytes,
+        mime_type: str = "image/jpeg",
+        supported_objects: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Analyze a camera image and return structured detections."""
+        if not self.config.gemini_api_key:
+            return {"summary": "Gemini is not configured", "detections": []}
+        objects = ", ".join(supported_objects) or "any visible objects"
+        response = await self._generate_with_gemini(
+            [
+                {
+                    "text": (
+                        "Analyze this image. Return only valid JSON with keys "
+                        "fire_detected, summary and detections. Set fire_detected "
+                        "to true for any visible fire, flame, or smoke. Each detection must contain "
+                        "label, confidence, and box as [left, top, right, bottom]. "
+                        f"Focus on these objects: {objects}."
+                    )
+                },
+                {
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": base64.b64encode(image_data).decode("ascii"),
+                    }
+                },
+            ],
+            response_json=True,
+        )
+        return json.loads(response)
+
+    async def _generate_with_gemini(
+        self,
+        parts: list[dict[str, Any]],
+        response_json: bool = False,
+    ) -> str:
+        """Send multimodal content to the configured Gemini endpoint."""
+        url = self.config.gemini_api_url.format(model=self.config.gemini_model)
+        query_params = list(parse_qsl(urlsplit(url).query, keep_blank_values=True))
+        query_params.append(("key", self.config.gemini_api_key or ""))
+        split_url = urlsplit(url)
+        url = urlunsplit(split_url._replace(query=urlencode(query_params)))
+        payload = {
+            "contents": [{"role": "user", "parts": parts}],
+        }
+        if response_json:
+            payload["generationConfig"] = {"responseMimeType": "application/json"}
+        request = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        response_body = await asyncio.to_thread(self._post_json, request)
+        response = json.loads(response_body)
+        return response["candidates"][0]["content"]["parts"][0]["text"]
+
+    @staticmethod
+    def _post_json(request: Request) -> str:
+        """Send a JSON request without adding another HTTP dependency."""
+        with urlopen(request, timeout=30) as response:
+            return response.read().decode("utf-8")

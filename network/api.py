@@ -146,7 +146,10 @@ async def diagnostics(request: Request) -> dict[str, Any]:
                 },
                 "llm": {
                     "ready": llm_ready,
-                    "configured": bool(getattr(request.app.state.config, "openai_api_key", None)),
+                    "configured": bool(
+                        getattr(request.app.state.config, "openai_api_key", None)
+                        or getattr(request.app.state.config, "gemini_api_key", None)
+                    ),
                 },
             },
         },
@@ -189,6 +192,15 @@ async def text_command(request: Request) -> dict[str, Any]:
     return success({"intent": intent}, message="text_command")
 
 
+@router.post("/command/voice")
+async def voice_command(request: Request) -> dict[str, Any]:
+    """Transcribe a raw audio request with Gemini and execute the command."""
+    audio_data = await request.body()
+    mime_type = request.headers.get("content-type", "audio/wav").split(";", 1)[0]
+    intent = await request.app.state.assistant.handle_voice_command(audio_data, mime_type=mime_type)
+    return success({"intent": intent}, message="voice_command")
+
+
 @router.post("/camera/capture")
 async def camera_capture(request: Request) -> dict[str, Any]:
     """Capture an image from the camera and return its saved path."""
@@ -196,6 +208,18 @@ async def camera_capture(request: Request) -> dict[str, Any]:
     output_path = "captures/latest.jpg"
     camera.capture_image(output_path)
     return success({"path": output_path}, message="camera_capture")
+
+
+@router.post("/camera/analyze")
+async def camera_analyze(request: Request) -> dict[str, Any]:
+    """Capture a frame and analyze it with the configured vision LLM."""
+    frame = request.app.state.camera.read_frame()
+    if frame is None:
+        return success({"summary": "Camera frame unavailable", "detections": []}, message="camera_analyze")
+    analysis = await request.app.state.vision.analyze(frame.image)
+    if request.app.state.vision.fire_detected(analysis):
+        request.app.state.fire_monitor.stop_for_fire()
+    return success(analysis, message="camera_analyze")
 
 
 @router.get("/lidar/scan")
