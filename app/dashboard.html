@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0a0e10">
+  <title>OmniBot Dashboard</title>
+  <link rel="stylesheet" href="/app/dashboard.css?v=13">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">OMNIBOT · CONTROL</p>
+        <h1 id="robot-name">Robot dashboard</h1>
+      </div>
+      <div class="topbar-right">
+        <button id="siren-btn" class="icon-button siren-btn" type="button">🔇 Siren off</button>
+        <span id="uptime" class="uptime">uptime --</span>
+        <span id="connection" class="connection offline">Offline</span>
+      </div>
+    </header>
+
+    <div id="fire-banner" class="fire-banner" hidden>🔥 FIRE DETECTED — robot halted</div>
+
+    <div class="board">
+      <section class="panel wide">
+        <div class="panel-heading"><h2>Robot status</h2><button id="refresh-button" class="icon-button" type="button">Refresh</button></div>
+        <div class="grid grid-4">
+          <div class="stat"><span>Mode</span><strong id="mode">--</strong></div>
+          <div class="stat"><span>Mission</span><strong id="mission">--</strong></div>
+          <div class="stat"><span>Battery</span><strong id="battery">--</strong></div>
+          <div class="stat"><span>Temperature</span><strong id="temperature">--</strong></div>
+          <div class="stat"><span>Speed vx vy wz</span><strong id="speed">--</strong></div>
+          <div class="stat"><span>AI state</span><strong id="ai-state">--</strong></div>
+          <div class="stat"><span>Proximity</span><strong id="proximity">--</strong></div>
+          <div class="stat"><span>Safe direction</span><strong id="safe-direction">--</strong></div>
+          <div class="stat"><span>Heartbeat</span><strong id="heartbeat">--</strong></div>
+          <div class="stat"><span>Fire monitor</span><strong id="fire">--</strong></div>
+        </div>
+      </section>
+
+      <section class="panel wide">
+        <div class="panel-heading"><h2>Control mode</h2><span id="mode-indicator" class="uptime">mode --</span></div>
+        <div class="mode-toggle">
+          <button id="mode-manual-btn" class="mode-btn" type="button">🕹️ 수동조작<span>Manual</span></button>
+          <button id="mode-auto-btn" class="mode-btn" type="button">🤖 자율주행<span>Autonomous</span></button>
+        </div>
+        <p class="hint" id="mode-hint">수동조작 모드에서만 조이스틱·LLM 명령을 사용할 수 있습니다. 자율주행 모드에서는 라이다·카메라 기반 회피 주행이 동작합니다.</p>
+      </section>
+
+      <section class="panel wide">
+        <div class="panel-heading"><h2>Hardware</h2></div>
+        <div class="grid grid-3">
+          <div class="hw-card" id="hw-stm32">
+            <div class="hw-head"><span>STM32</span><span class="badge offline" id="stm32-badge">offline</span></div>
+            <p class="hw-detail" id="stm32-detail">no data</p>
+          </div>
+          <div class="hw-card" id="hw-camera">
+            <div class="hw-head"><span>Camera</span><span class="badge offline" id="camera-badge">offline</span></div>
+            <p class="hw-detail" id="camera-detail">no data</p>
+          </div>
+          <div class="hw-card" id="hw-lidar">
+            <div class="hw-head"><span>Lidar</span><span class="badge offline" id="lidar-badge">offline</span></div>
+            <p class="hw-detail" id="lidar-detail">no data</p>
+          </div>
+          <div class="hw-card" id="hw-llm">
+            <div class="hw-head"><span>LLM</span><span class="badge offline" id="llm-badge">offline</span></div>
+            <p class="hw-detail" id="llm-detail">no data</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel wide">
+        <div class="panel-heading">
+          <h2>Autonomous navigation</h2>
+          <span id="nav-stream-state" class="uptime">stream --</span>
+        </div>
+        <div class="nav-grid">
+          <div class="nav-radar-wrap">
+            <canvas id="nav-radar" width="400" height="400" class="nav-radar"></canvas>
+            <p class="nav-radar-cap">4-wheel omni · lidar-centred · dashed = camera-fused</p>
+          </div>
+          <div class="nav-side">
+            <p id="nav-mode-note" class="hw-detail">manual mode — switch to Autonomous in Control mode to start auto-drive</p>
+            <div class="grid grid-2">
+              <div class="stat"><span>State</span><strong id="nav-decision">--</strong></div>
+              <div class="stat"><span>Proximity</span><strong id="nav-proximity">--</strong></div>
+              <div class="stat"><span>Velocity vx wz</span><strong id="nav-velocity">--</strong></div>
+              <div class="stat"><span>Safe direction</span><strong id="nav-safe-direction">--</strong></div>
+              <div class="stat"><span>STM32</span><strong id="nav-stm32">--</strong></div>
+              <div class="stat"><span>Battery</span><strong id="nav-battery">--</strong></div>
+            </div>
+            <p id="nav-reason" class="hw-detail"></p>
+            <p id="nav-camera-fusion" class="hw-detail">camera: off</p>
+            <div class="grid grid-3" id="nav-sectors"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading"><h2>Camera</h2><button id="camera-refresh-btn" class="icon-button" type="button">Refresh</button></div>
+        <img id="camera-feed" class="media-frame" alt="camera feed">
+        <div class="media-actions">
+          <button id="camera-capture-btn" class="icon-button" type="button">Capture</button>
+          <button id="camera-analyze-btn" class="icon-button" type="button">Analyze</button>
+        </div>
+        <p id="camera-result" class="hw-detail"></p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>SLAM map</h2>
+          <span id="slam-stream-state" class="uptime">stream --</span>
+        </div>
+        <div class="nav-radar-wrap">
+          <canvas id="slam-canvas" width="420" height="420" class="nav-radar"></canvas>
+          <p class="nav-radar-cap">occupancy grid · live · trail = path</p>
+        </div>
+        <div class="grid grid-3">
+          <div class="stat"><span>Pose x y</span><strong id="slam-pose-xy">--</strong></div>
+          <div class="stat"><span>Heading</span><strong id="slam-pose-yaw">--</strong></div>
+          <div class="stat"><span>Explored</span><strong id="slam-explored">--</strong></div>
+        </div>
+      </section>
+
+      <section class="panel" id="motion-panel">
+        <div class="panel-heading"><h2>Motion control</h2><span class="badge manual-only-badge">manual only</span></div>
+        <div class="motion-grid">
+          <div class="dpad">
+            <button class="dpad-btn dpad-ccw" data-vx="0" data-vy="0" data-wz="0.6" type="button" aria-label="Rotate left">&#8634;</button>
+            <button class="dpad-btn dpad-up" data-vx="0.2" data-vy="0" data-wz="0" type="button" aria-label="Forward">&#9650;</button>
+            <button class="dpad-btn dpad-cw" data-vx="0" data-vy="0" data-wz="-0.6" type="button" aria-label="Rotate right">&#8635;</button>
+            <button class="dpad-btn dpad-left" data-vx="0" data-vy="-0.2" data-wz="0" type="button" aria-label="Strafe left">&#9664;</button>
+            <button class="dpad-btn dpad-stop" id="motion-stop-btn" type="button" aria-label="Stop">&#9632;</button>
+            <button class="dpad-btn dpad-right" data-vx="0" data-vy="0.2" data-wz="0" type="button" aria-label="Strafe right">&#9654;</button>
+            <span></span>
+            <button class="dpad-btn dpad-down" data-vx="-0.2" data-vy="0" data-wz="0" type="button" aria-label="Backward">&#9660;</button>
+            <span></span>
+          </div>
+          <div class="motion-manual">
+            <label>vx <input id="vx-input" type="number" step="0.05" value="0"></label>
+            <label>vy <input id="vy-input" type="number" step="0.05" value="0"></label>
+            <label>wz <input id="wz-input" type="number" step="0.1" value="0"></label>
+            <button id="motion-send-btn" class="icon-button" type="button">Send</button>
+          </div>
+        </div>
+        <p id="motion-result" class="hw-detail"></p>
+      </section>
+
+      <section class="panel" id="text-command-panel">
+        <div class="panel-heading"><h2>Text command (LLM)</h2><span class="badge manual-only-badge">manual only</span></div>
+        <div class="text-command-row">
+          <input id="text-command-input" type="text" placeholder="예: 앞으로 가 / 왼쪽으로 돌아 / 멈춰" autocomplete="off">
+          <button id="text-command-btn" class="icon-button" type="button">Send</button>
+        </div>
+        <p id="text-command-result" class="hw-detail"></p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading"><h2>Emergency control</h2></div>
+        <div class="estop-row">
+          <p class="hint">Immediately halts motion and latches STM32 velocity commands.</p>
+          <button id="stop-button" class="stop-button" type="button">Emergency stop</button>
+        </div>
+        <p id="error" class="error" role="alert"></p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading"><h2>Lidar scan</h2><button id="lidar-refresh-btn" class="icon-button" type="button">Scan</button></div>
+        <div class="grid grid-3">
+          <div class="stat"><span>Proximity</span><strong id="lidar-proximity">--</strong></div>
+          <div class="stat"><span>Safe direction</span><strong id="lidar-safe-direction">--</strong></div>
+          <div class="stat"><span>Obstacles</span><strong id="lidar-obstacles">--</strong></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading"><h2>Recent events</h2></div>
+        <ul id="events-list" class="list"><li class="empty">No events yet</li></ul>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading"><h2>Recent alerts</h2></div>
+        <ul id="alerts-list" class="list"><li class="empty">No alerts</li></ul>
+      </section>
+    </div>
+  </main>
+  <script src="/app/dashboard.js?v=13"></script>
+</body>
+</html>

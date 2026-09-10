@@ -7,3 +7,12 @@ openai>=1.40.0
 pyserial>=3.5
 python-dotenv>=1.0.0
 pytest>=8.0.0
+# picamera2 (Pi Camera Module / CSI, used when ROBOT_CAMERA_SOURCE=pi) also
+# requires the system libcamera package with Python bindings on the host —
+# `pip install picamera2` alone is not enough. See README for setup notes.
+picamera2>=0.3.30
+# Local YOLOv8 fire/smoke detection for FireMonitor (camera/vision.py),
+# weights at models/fire_detection/fire_yolov8s.pt — see README for source.
+ultralytics>=8.4.0
+# MQTT publishing (fire detections, status). Broker: mosquitto on the host.
+paho-mqtt>=2.1.0

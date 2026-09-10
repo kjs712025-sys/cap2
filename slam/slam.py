@@ -1,18 +1,54 @@
-"""A lightweight SLAM implementation based on a simple occupancy grid and odometry."""
+"""Real-time occupancy-grid SLAM.
+
+A lightweight scan-matching-free SLAM: the pose is dead-reckoned from STM32
+odometry (or, lacking that, the commanded velocity), and every LiDAR scan is
+ray-cast into a fixed log-odds occupancy grid. Each beam clears the free space
+it travels through and reinforces the cell it terminates on, so the map
+converges on the real environment as the robot moves rather than just
+accumulating obstacle blobs.
+
+The navigator drives ``update_from_motion`` + ``update_from_lidar`` on every
+perception cycle (~4 Hz), so the map is always live. ``snapshot`` returns a
+compact base64 grid for the dashboard SSE stream.
+"""
 
 from __future__ import annotations
 
+import base64
+import math
+import struct
+import time
+import zlib
 from dataclasses import dataclass, field
 from typing import Any
 
-import math
-import struct
-import zlib
+import numpy as np
+
+# Grid geometry. 200 cells * 0.05 m = a 10 m x 10 m world, origin at the centre.
+GRID = 200
+RES = 0.05
+_HALF = GRID // 2
+
+# Log-odds update weights and clamps.
+L_FREE = -0.4
+L_OCC = 0.9
+L_MIN = -4.0
+L_MAX = 4.0
+# Beyond this range a beam only clears free space (an unterminated ray tells us
+# nothing about an obstacle at its far end).
+MAX_RANGE_M = 6.0
+
+# Classification thresholds for the rendered / streamed map.
+OCC_THRESH = 0.7
+FREE_THRESH = -0.5
+
+_TRAIL_MAX = 500
+_TRAIL_MIN_STEP_M = 0.03
 
 
 @dataclass(slots=True)
 class Pose:
-    """2D robot pose in meters and radians."""
+    """2D robot pose in metres and radians."""
 
     x: float = 0.0
     y: float = 0.0
@@ -21,7 +57,7 @@ class Pose:
 
 @dataclass(slots=True)
 class GridCell:
-    """A single occupancy-grid cell."""
+    """A single occupancy-grid cell (kept for API back-compat)."""
 
     occupied: bool = False
     cost: float = 0.0
@@ -29,48 +65,71 @@ class GridCell:
 
 @dataclass(slots=True)
 class SlamMap:
-    """Simple occupancy grid map."""
+    """Occupancy-grid metadata."""
 
-    width: int = 50
-    height: int = 50
-    resolution: float = 0.05
+    width: int = GRID
+    height: int = GRID
+    resolution: float = RES
     cells: list[list[GridCell]] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        if not self.cells:
-            self.cells = [
-                [GridCell() for _ in range(self.width)]
-                for _ in range(self.height)
-            ]
 
 
 class SimpleSlam:
-    """A minimal SLAM module that updates pose from motion commands and marks obstacles."""
+    """Log-odds occupancy-grid SLAM with dead-reckoned pose."""
 
     def __init__(self) -> None:
         self.pose = Pose()
         self.map = SlamMap()
+        self._log = np.zeros((GRID, GRID), dtype=np.float32)
         self._last_update: float = 0.0
         self.scan_points: list[dict[str, float]] = []
+        self.trail: list[tuple[float, float]] = [(0.0, 0.0)]
         self._motion_covariance: float = 0.02
 
+    # -- pose --------------------------------------------------------------
+
     def update_from_motion(self, vx: float, vy: float, wz: float, dt: float = 0.1) -> Pose:
-        """Update pose using a motion model with basic drift compensation."""
+        """Integrate a velocity command into the pose with light drift compensation."""
         linear_scale = max(0.0, 1.0 - min(abs(vx) + abs(vy), 0.3) * 0.02)
         angular_scale = max(0.0, 1.0 - min(abs(wz), 0.3) * 0.01)
 
-        self.pose.x += vx * dt * linear_scale
-        self.pose.y += vy * dt * linear_scale
-        self.pose.yaw += wz * dt * angular_scale
-        self.pose.yaw = self.pose.yaw % (2.0 * math.pi)
+        # Body-frame velocity rotated into the world frame.
+        cos_y, sin_y = math.cos(self.pose.yaw), math.sin(self.pose.yaw)
+        self.pose.x += (vx * cos_y - vy * sin_y) * dt * linear_scale
+        self.pose.y += (vx * sin_y + vy * cos_y) * dt * linear_scale
+        self.pose.yaw = (self.pose.yaw + wz * dt * angular_scale) % (2.0 * math.pi)
         self._last_update = dt
-        self._mark_obstacles()
+        self._push_trail()
         return self.pose
 
-    def update_from_lidar(self, scan_points: list[dict[str, float]] | list[tuple[float, float]]) -> None:
-        """Update the map using a simple polar-to-Cartesian obstacle projection and clustering."""
+    def set_pose(self, x: float, y: float, yaw: float) -> None:
+        """Adopt an externally supplied pose (e.g. STM32 wheel odometry)."""
+        self.pose.x, self.pose.y, self.pose.yaw = float(x), float(y), float(yaw) % (2.0 * math.pi)
+        self._push_trail()
+
+    def _push_trail(self) -> None:
+        if not self.trail or math.hypot(self.pose.x - self.trail[-1][0], self.pose.y - self.trail[-1][1]) >= _TRAIL_MIN_STEP_M:
+            self.trail.append((round(self.pose.x, 3), round(self.pose.y, 3)))
+            if len(self.trail) > _TRAIL_MAX:
+                self.trail = self.trail[-_TRAIL_MAX:]
+
+    # -- mapping ---------------------------------------------------------
+
+    @staticmethod
+    def _to_cell(x: float, y: float) -> tuple[int, int]:
+        return int(round(x / RES)) + _HALF, int(round(y / RES)) + _HALF
+
+    def update_from_lidar(
+        self, scan_points: list[dict[str, float]] | list[tuple[float, float]]
+    ) -> None:
+        """Ray-cast every beam into the log-odds grid."""
         self.scan_points = []
-        clusters: list[list[tuple[float, float]]] = []
+        rc, rr = self._to_cell(self.pose.x, self.pose.y)
+        if not (0 <= rc < GRID and 0 <= rr < GRID):
+            return  # robot has driven off the mapped area
+
+        free_cells: list[np.ndarray] = []
+        occ_c: list[int] = []
+        occ_r: list[int] = []
 
         for point in scan_points:
             if isinstance(point, tuple):
@@ -80,97 +139,107 @@ class SimpleSlam:
                 distance_m = float(point.get("distance_m", 0.0))
             if distance_m <= 0.0:
                 continue
-            angle_rad = math.radians(angle_deg)
-            world_x = self.pose.x + distance_m * math.cos(self.pose.yaw + angle_rad)
-            world_y = self.pose.y + distance_m * math.sin(self.pose.yaw + angle_rad)
-            self.scan_points.append({"angle_deg": angle_deg, "distance_m": distance_m, "x": round(world_x, 3), "y": round(world_y, 3)})
 
-            if not clusters or not self._is_close_to_any_cluster(world_x, world_y, clusters):
-                clusters.append([(world_x, world_y)])
-            else:
-                for cluster in clusters:
-                    if self._is_close_to_any_cluster(world_x, world_y, [cluster]):
-                        cluster.append((world_x, world_y))
-                        break
+            bearing = self.pose.yaw + math.radians(angle_deg)
+            hit = min(distance_m, MAX_RANGE_M)
+            wx = self.pose.x + hit * math.cos(bearing)
+            wy = self.pose.y + hit * math.sin(bearing)
+            ec, er = self._to_cell(wx, wy)
 
-        for cluster in clusters:
-            if len(cluster) >= 2:
-                center_x = sum(x for x, _ in cluster) / len(cluster)
-                center_y = sum(y for _, y in cluster) / len(cluster)
-                self._mark_cluster(center_x, center_y, len(cluster))
-            else:
-                x, y = cluster[0]
-                self._mark_cluster(x, y, 1)
+            steps = max(1, int(hit / RES))
+            cs = np.linspace(rc, ec, steps, endpoint=False).astype(np.int32)
+            rs = np.linspace(rr, er, steps, endpoint=False).astype(np.int32)
+            free_cells.append(np.stack((rs, cs), axis=1))
 
-    def _mark_obstacles(self) -> None:
-        """Add a simple obstacle hint around the current pose."""
-        x_idx = int(self.pose.x / self.map.resolution) + self.map.width // 2
-        y_idx = int(self.pose.y / self.map.resolution) + self.map.height // 2
-        if 0 <= x_idx < self.map.width and 0 <= y_idx < self.map.height:
-            self.map.cells[y_idx][x_idx].occupied = True
-            self.map.cells[y_idx][x_idx].cost = 1.0
+            if distance_m <= MAX_RANGE_M and 0 <= ec < GRID and 0 <= er < GRID:
+                occ_c.append(ec)
+                occ_r.append(er)
+                self.scan_points.append(
+                    {
+                        "angle_deg": round(angle_deg, 1),
+                        "distance_m": round(distance_m, 3),
+                        "x": round(wx, 3),
+                        "y": round(wy, 3),
+                    }
+                )
 
-    def _is_close_to_any_cluster(self, world_x: float, world_y: float, clusters: list[list[tuple[float, float]]]) -> bool:
-        """Check whether a point belongs to an existing cluster based on a distance threshold."""
-        for cluster in clusters:
-            for cx, cy in cluster:
-                if math.hypot(world_x - cx, world_y - cy) < 0.15:
-                    return True
-        return False
+        if free_cells:
+            fc = np.concatenate(free_cells, axis=0)
+            valid = (fc[:, 0] >= 0) & (fc[:, 0] < GRID) & (fc[:, 1] >= 0) & (fc[:, 1] < GRID)
+            fc = fc[valid]
+            np.add.at(self._log, (fc[:, 0], fc[:, 1]), L_FREE)
 
-    def _mark_cluster(self, world_x: float, world_y: float, weight: int) -> None:
-        """Mark a cluster of obstacle observations with a weighted update."""
-        x_idx = int(world_x / self.map.resolution) + self.map.width // 2
-        y_idx = int(world_y / self.map.resolution) + self.map.height // 2
-        if 0 <= x_idx < self.map.width and 0 <= y_idx < self.map.height:
-            cell = self.map.cells[y_idx][x_idx]
-            cell.occupied = True
-            cell.cost = min(1.0, cell.cost + 0.18 * weight)
+        if occ_c:
+            np.add.at(self._log, (np.array(occ_r), np.array(occ_c)), L_OCC)
 
-            for offset in ((0, 1), (1, 0), (0, -1), (-1, 0)):
-                ox, oy = offset
-                nx = x_idx + ox
-                ny = y_idx + oy
-                if 0 <= nx < self.map.width and 0 <= ny < self.map.height:
-                    neighbor = self.map.cells[ny][nx]
-                    neighbor.occupied = neighbor.occupied or cell.cost > 0.4
-                    neighbor.cost = max(neighbor.cost, min(1.0, cell.cost - 0.1))
+        np.clip(self._log, L_MIN, L_MAX, out=self._log)
+        self._last_update = time.time()
+
+    # -- serialisation -------------------------------------------------
+
+    def _packed_grid(self) -> np.ndarray:
+        packed = np.zeros((GRID, GRID), dtype=np.uint8)
+        packed[self._log < FREE_THRESH] = 1
+        packed[self._log > OCC_THRESH] = 2
+        return packed
+
+    def snapshot(self) -> dict[str, Any]:
+        """Compact live map for the dashboard SSE stream."""
+        packed = self._packed_grid()
+        return {
+            "resolution_m": RES,
+            "size": GRID,
+            "origin_m": {"x": -_HALF * RES, "y": -_HALF * RES},
+            "pose": {"x": round(self.pose.x, 3), "y": round(self.pose.y, 3), "yaw": round(self.pose.yaw, 3)},
+            "trail": self.trail[-_TRAIL_MAX:],
+            "grid_b64": base64.b64encode(packed.tobytes()).decode("ascii"),
+            "occupied_cells": int((packed == 2).sum()),
+            "explored_frac": round(float((packed > 0).mean()), 3),
+            "scan_points": self.scan_points,
+            "updated_at": self._last_update,
+        }
 
     def to_payload(self) -> dict[str, Any]:
-        """Serialize the current state for API responses."""
-        grid = []
-        for row in self.map.cells:
-            grid.append([{"occupied": cell.occupied, "cost": cell.cost} for cell in row])
+        """Full-ish state for the REST endpoints (occupied cells + probability)."""
+        prob = 1.0 - 1.0 / (1.0 + np.exp(self._log))
+        occ_r, occ_c = np.where(self._log > OCC_THRESH)
+        occupied = [
+            [int(c), int(r), round(float(prob[r, c]), 2)]
+            for r, c in zip(occ_r.tolist(), occ_c.tolist())
+        ]
         return {
             "pose": {"x": round(self.pose.x, 3), "y": round(self.pose.y, 3), "yaw": round(self.pose.yaw, 3)},
-            "grid": grid,
-            "resolution_m": self.map.resolution,
+            "resolution_m": RES,
+            "size": GRID,
+            "origin_m": {"x": -_HALF * RES, "y": -_HALF * RES},
+            "grid": occupied,
+            "occupied": occupied,
+            "trail": self.trail[-_TRAIL_MAX:],
             "scan_points": self.scan_points,
         }
 
     def render_image(self) -> bytes:
-        """Render the occupancy grid to a PNG image bytestring without external dependencies."""
-        width = self.map.width
-        height = self.map.height
+        """Render the occupancy grid to a PNG bytestring (no external deps)."""
 
         def chunk(chunk_type: bytes, payload: bytes) -> bytes:
-            return struct.pack("!I", len(payload)) + chunk_type + payload + struct.pack("!I", zlib.crc32(chunk_type + payload) & 0xFFFFFFFF)
+            return (
+                struct.pack("!I", len(payload))
+                + chunk_type
+                + payload
+                + struct.pack("!I", zlib.crc32(chunk_type + payload) & 0xFFFFFFFF)
+            )
 
-        rows: list[bytes] = []
-        for y in range(height):
-            row = bytearray(b"\x00")
-            for x in range(width):
-                cell = self.map.cells[y][x]
-                if cell.occupied:
-                    row.extend((180, 60, 60))
-                else:
-                    row.extend((240, 240, 240))
-            rows.append(bytes(row))
+        packed = self._packed_grid()
+        # Row 0 at the top: flip so +y points up like a conventional map.
+        packed = packed[::-1]
+        palette = np.array([[205, 205, 205], [245, 245, 245], [180, 60, 60]], dtype=np.uint8)
+        rgb = palette[packed]  # (H, W, 3)
 
+        rows = [b"\x00" + rgb[y].tobytes() for y in range(GRID)]
         raw_data = b"".join(rows)
-        ihdr = struct.pack("!IIBBBBB", width, height, 8, 2, 0, 0, 0)
+        ihdr = struct.pack("!IIBBBBB", GRID, GRID, 8, 2, 0, 0, 0)
         png_bytes = b"\x89PNG\r\n\x1a\n"
         png_bytes += chunk(b"IHDR", ihdr)
-        png_bytes += chunk(b"IDAT", zlib.compress(raw_data, level=9))
+        png_bytes += chunk(b"IDAT", zlib.compress(raw_data, level=6))
         png_bytes += chunk(b"IEND", b"")
         return png_bytes

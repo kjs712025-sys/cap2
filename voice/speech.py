@@ -15,15 +15,16 @@ class SpeechRecognizer:
         self.llm = llm
 
     async def transcribe(self, audio_data: Any, mime_type: str = "audio/wav") -> str:
-        """Return a simple fallback transcription when no model is attached."""
+        """Transcribe audio via Gemini, or fall back to a stub."""
         if audio_data is None:
             return ""
-        if isinstance(audio_data, bytes) and self.llm is not None:
-            transcription = await self.llm.transcribe_audio(audio_data, mime_type=mime_type)
-            if transcription:
-                return transcription
         if isinstance(audio_data, str):
             return audio_data.strip()
-        if isinstance(audio_data, bytes):
-            return "voice command"
-        return "voice command"
+        if isinstance(audio_data, bytes) and self.llm is not None:
+            try:
+                transcription = await self.llm.transcribe_audio(audio_data, mime_type=mime_type)
+            except Exception:  # noqa: BLE001 - bad audio / API error -> caller decides
+                return ""
+            if transcription:
+                return transcription
+        return "" if isinstance(audio_data, bytes) else "voice command"

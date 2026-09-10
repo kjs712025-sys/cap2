@@ -66,10 +66,86 @@ class LLMService:
         )
 
     def is_ready(self) -> bool:
-        """Return whether the LLM service is usable."""
+        """Return whether the LLM service is usable (Gemini key or OpenAI client)."""
+        if self.config.gemini_api_key:
+            return True
         if self.client is None:
             self.connect()
         return self.client is not None
+
+    async def interpret_motion(self, user_text: str) -> dict[str, Any]:
+        """Turn a spoken/typed command into a timed velocity for manual driving.
+
+        Returns ``{action, vx, vy, wz, duration_s, speech}``. Uses Gemini when a
+        key is configured, else a Korean/English keyword fallback.
+        """
+        max_lin = self.config.max_linear_speed
+        max_ang = self.config.max_angular_speed
+        cruise = min(0.15, max_lin)
+        turn = min(0.5, max_ang)
+
+        if self.config.gemini_api_key:
+            try:
+                prompt = (
+                    "You drive a 4-wheel omni-directional robot. Convert the user's command "
+                    "into ONE motion. Frame: vx forward(+)/back(-) m/s, vy left(+)/right(-) m/s, "
+                    f"wz turn-left/ccw(+)/right/cw(-) rad/s. Limits |vx|,|vy|<={max_lin}, |wz|<={max_ang}. "
+                    f"Use gentle magnitudes (~{cruise} m/s, ~{turn} rad/s) unless 'fast'/'slow' is said. "
+                    'Return ONLY JSON: {"action":"move"|"turn"|"strafe"|"stop"|"none",'
+                    '"vx":0.0,"vy":0.0,"wz":0.0,"duration_s":1.5,"speech":"short confirmation '
+                    'in the user\'s language"}. duration_s in [0.5,4]. '
+                    f"Command: {user_text}"
+                )
+                raw = await self._generate_with_gemini([{"text": prompt}], response_json=True)
+                result = json.loads(raw)
+                return self._clamp_motion(result, user_text)
+            except Exception as exc:  # pragma: no cover - network-dependent
+                logger.warning("Gemini motion interpretation failed: %s", exc)
+
+        return self._keyword_motion(user_text, cruise, turn)
+
+    def _clamp_motion(self, result: dict[str, Any], user_text: str) -> dict[str, Any]:
+        max_lin = self.config.max_linear_speed
+        max_ang = self.config.max_angular_speed
+
+        def clamp(v: Any, lo: float, hi: float, default: float = 0.0) -> float:
+            try:
+                return max(lo, min(hi, float(v)))
+            except (TypeError, ValueError):
+                return default
+
+        return {
+            "action": str(result.get("action", "none")),
+            "vx": clamp(result.get("vx"), -max_lin, max_lin),
+            "vy": clamp(result.get("vy"), -max_lin, max_lin),
+            "wz": clamp(result.get("wz"), -max_ang, max_ang),
+            "duration_s": clamp(result.get("duration_s"), 0.5, 4.0, 1.5) or 1.5,
+            "speech": str(result.get("speech") or "명령을 실행합니다"),
+            "transcript": user_text,
+        }
+
+    def _keyword_motion(self, text: str, cruise: float, turn: float) -> dict[str, Any]:
+        t = (text or "").lower().strip()
+        m = {"vx": 0.0, "vy": 0.0, "wz": 0.0, "duration_s": 1.5}
+        if any(k in t for k in ("stop", "멈춰", "정지", "스톱", "그만", "halt")):
+            return {"action": "stop", "speech": "정지합니다", "transcript": text, **{k: 0.0 for k in ("vx", "vy", "wz")}, "duration_s": 0.5}
+        if any(k in t for k in ("돌아", "회전", "turn", "rotate", "spin")):
+            left = any(k in t for k in ("왼", "left", "좌", "ccw"))
+            m["wz"] = turn if left else -turn
+            action, speech = "turn", ("왼쪽으로 회전합니다" if left else "오른쪽으로 회전합니다")
+        elif any(k in t for k in ("뒤", "후진", "back", "reverse")):
+            m["vx"] = -cruise
+            action, speech = "move", "후진합니다"
+        elif any(k in t for k in ("앞", "전진", "직진", "forward", "go", "straight", "이동", "가")):
+            if any(k in t for k in ("왼", "left", "좌")):
+                m["vy"], action, speech = cruise, "strafe", "왼쪽으로 이동합니다"
+            elif any(k in t for k in ("오른", "right", "우")):
+                m["vy"], action, speech = -cruise, "strafe", "오른쪽으로 이동합니다"
+            else:
+                m["vx"], action, speech = cruise, "move", "전진합니다"
+        else:
+            return {"action": "none", "speech": "명령을 이해하지 못했습니다", "transcript": text, "vx": 0.0, "vy": 0.0, "wz": 0.0, "duration_s": 0.0}
+        return {"action": action, "speech": speech, "transcript": text, **m}
 
     async def infer_intent(self, user_text: str) -> dict[str, Any]:
         """Infer the intended action from user text."""

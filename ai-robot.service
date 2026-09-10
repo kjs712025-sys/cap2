@@ -1,21 +1,29 @@
 [Unit]
-Description=AI Robot Backend
-After=network-online.target
-Wants=network-online.target
-After=dev-serial0.device
+Description=AI Robot Backend (FastAPI + camera + lidar + navigation)
+Documentation=https://github.com/local/sung-jin
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+# Never stop trying to bring the robot back up.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-WorkingDirectory=/home/meka/AI_Robot
-ExecStart=/home/meka/AI_Robot/start.sh
+WorkingDirectory=/home/meka/sung-jin
+ExecStart=/home/meka/sung-jin/start.sh
 Restart=always
 RestartSec=5
 User=meka
-SupplementaryGroups=dialout
+SupplementaryGroups=dialout video
 Environment=ROBOT_HOST=0.0.0.0
 Environment=ROBOT_PORT=8000
 Environment=ROBOT_DEBUG=1
+Environment=ROBOT_FIRE_MONITOR_ENABLED=1
+# Start driving autonomously on boot. ROBOT_NAV_AUTOSTART actually enables the
+# navigator; the delay lets the LiDAR/camera come up first. Set both to 0 to
+# boot in manual mode instead.
 Environment=ROBOT_AUTOSTART_AUTONOMOUS=1
+Environment=ROBOT_NAV_AUTOSTART=1
+Environment=ROBOT_NAV_AUTOSTART_DELAY=8
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
