@@ -108,11 +108,27 @@ def test_actionable_detection_halts_autonomous_navigation() -> None:
     navigator.enabled = True
     monitor, stm32, status = _make_monitor([Detection("smoke", 0.5, _box())], navigator=navigator)
 
+    # First sighting: alert flag set, but navigation not halted yet (debounce).
     asyncio.run(monitor.check_once())
-
-    navigator.disable.assert_called_once()
     assert status.metadata.get("fire_alert") == "warn"
+    navigator.disable.assert_not_called()
+
+    # Second consecutive sighting: now the soft halt engages.
+    asyncio.run(monitor.check_once())
+    navigator.disable.assert_called_once()
     assert status.mission == "fire_halt"
+
+
+def test_single_flicker_detection_does_not_halt_navigation() -> None:
+    navigator = MagicMock()
+    navigator.enabled = True
+    monitor, stm32, status = _make_monitor([Detection("smoke", 0.5, _box())], navigator=navigator)
+
+    asyncio.run(monitor.check_once())          # one sighting
+    monitor.vision.detect_fire.return_value = []
+    asyncio.run(monitor.check_once())          # then clear -> streak resets
+
+    navigator.disable.assert_not_called()
 
 
 def test_cleared_view_drops_fire_alert() -> None:

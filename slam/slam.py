@@ -121,58 +121,69 @@ class SimpleSlam:
     def update_from_lidar(
         self, scan_points: list[dict[str, float]] | list[tuple[float, float]]
     ) -> None:
-        """Ray-cast every beam into the log-odds grid."""
+        """Ray-cast every beam into the log-odds grid (fully vectorised)."""
         self.scan_points = []
-        rc, rr = self._to_cell(self.pose.x, self.pose.y)
+        px, py, yaw = self.pose.x, self.pose.y, self.pose.yaw
+        rc, rr = self._to_cell(px, py)
         if not (0 <= rc < GRID and 0 <= rr < GRID):
             return  # robot has driven off the mapped area
 
-        free_cells: list[np.ndarray] = []
-        occ_c: list[int] = []
-        occ_r: list[int] = []
-
+        angles: list[float] = []
+        dists: list[float] = []
         for point in scan_points:
             if isinstance(point, tuple):
-                angle_deg, distance_m = point
+                a, d = point
             else:
-                angle_deg = float(point.get("angle_deg", 0.0))
-                distance_m = float(point.get("distance_m", 0.0))
-            if distance_m <= 0.0:
-                continue
+                a = float(point.get("angle_deg", 0.0))
+                d = float(point.get("distance_m", 0.0))
+            if d > 0.0:
+                angles.append(a)
+                dists.append(d)
+        if not angles:
+            return
 
-            bearing = self.pose.yaw + math.radians(angle_deg)
-            hit = min(distance_m, MAX_RANGE_M)
-            wx = self.pose.x + hit * math.cos(bearing)
-            wy = self.pose.y + hit * math.sin(bearing)
-            ec, er = self._to_cell(wx, wy)
+        ang_deg = np.asarray(angles, dtype=np.float64)
+        dist = np.asarray(dists, dtype=np.float64)
+        bearing = np.radians(ang_deg) + yaw
+        hit = np.minimum(dist, MAX_RANGE_M)
+        ex = px + hit * np.cos(bearing)
+        ey = py + hit * np.sin(bearing)
+        ec = (np.round(ex / RES) + _HALF).astype(np.int64)
+        er = (np.round(ey / RES) + _HALF).astype(np.int64)
 
-            steps = max(1, int(hit / RES))
-            cs = np.linspace(rc, ec, steps, endpoint=False).astype(np.int32)
-            rs = np.linspace(rr, er, steps, endpoint=False).astype(np.int32)
-            free_cells.append(np.stack((rs, cs), axis=1))
+        # Free-space carving: march every ray from the robot to its endpoint
+        # over a shared [0, 1) step grid (dense enough for the longest ray),
+        # then dedupe cells so each is cleared at most once per scan.
+        steps = max(1, int(MAX_RANGE_M / RES))
+        t = np.linspace(0.0, 1.0, steps, endpoint=False)  # (S,)
+        fr = np.rint(rr + (er - rr)[:, None] * t[None, :]).astype(np.int64)
+        fc = np.rint(rc + (ec - rc)[:, None] * t[None, :]).astype(np.int64)
+        inb = (fr >= 0) & (fr < GRID) & (fc >= 0) & (fc < GRID)
+        free_flat = np.unique(fr[inb] * GRID + fc[inb])
 
-            if distance_m <= MAX_RANGE_M and 0 <= ec < GRID and 0 <= er < GRID:
-                occ_c.append(ec)
-                occ_r.append(er)
-                self.scan_points.append(
-                    {
-                        "angle_deg": round(angle_deg, 1),
-                        "distance_m": round(distance_m, 3),
-                        "x": round(wx, 3),
-                        "y": round(wy, 3),
-                    }
-                )
+        # Occupied endpoints: real returns within range only.
+        real = (dist <= MAX_RANGE_M) & (ec >= 0) & (ec < GRID) & (er >= 0) & (er < GRID)
+        occ_flat = np.unique(er[real] * GRID + ec[real]) if real.any() else np.empty(0, np.int64)
 
-        if free_cells:
-            fc = np.concatenate(free_cells, axis=0)
-            valid = (fc[:, 0] >= 0) & (fc[:, 0] < GRID) & (fc[:, 1] >= 0) & (fc[:, 1] < GRID)
-            fc = fc[valid]
-            np.add.at(self._log, (fc[:, 0], fc[:, 1]), L_FREE)
+        # A cell that is an obstacle endpoint for any beam must not also be
+        # cleared as free this scan (the march samples land on the endpoint).
+        free_flat = np.setdiff1d(free_flat, occ_flat, assume_unique=True)
 
-        if occ_c:
-            np.add.at(self._log, (np.array(occ_r), np.array(occ_c)), L_OCC)
-
+        flat = self._log.reshape(-1)
+        flat[free_flat] += L_FREE
+        flat[occ_flat] += L_OCC
         np.clip(self._log, L_MIN, L_MAX, out=self._log)
+
+        idx = np.nonzero(real)[0]
+        self.scan_points = [
+            {
+                "angle_deg": round(float(ang_deg[i]), 1),
+                "distance_m": round(float(dist[i]), 3),
+                "x": round(float(ex[i]), 3),
+                "y": round(float(ey[i]), 3),
+            }
+            for i in idx
+        ]
         self._last_update = time.time()
 
     # -- serialisation -------------------------------------------------

@@ -68,3 +68,29 @@ def test_manual_endpoint_drives_from_text() -> None:
     r = client.post("/command/manual", json={"text": "앞으로 가"}).json()
     assert r["success"] and r["data"]["motion"]["action"] == "move"
     assert client.post("/command/stop").json()["data"]["action"] == "stop"
+
+
+def test_voice_endpoint_available_in_manual_refused_in_autonomous() -> None:
+    from fastapi.testclient import TestClient
+    from network.server import create_app
+
+    app = create_app(RobotConfig(debug=True, llm_enabled=False, enable_websocket=False))
+    client = TestClient(app)
+
+    # no key -> transcription returns "" -> assistant reports "none", but the
+    # request itself is accepted from the dashboard in manual mode
+    ok = client.post(
+        "/command/voice", content=b"RIFFxxxxWAVE", headers={"Content-Type": "audio/wav"}
+    ).json()
+    assert ok["success"] is True
+
+    client.post("/mode", json={"mode": "auto"})
+    refused = client.post(
+        "/command/voice", content=b"RIFFxxxxWAVE", headers={"Content-Type": "audio/wav"}
+    ).json()
+    assert refused["success"] is False and refused["error"] == "autonomous_active"
+
+    empty = client.post("/mode", json={"mode": "manual"}) and client.post(
+        "/command/voice", content=b"", headers={"Content-Type": "audio/wav"}
+    ).json()
+    assert empty["error"] == "no_audio"

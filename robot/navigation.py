@@ -246,16 +246,14 @@ class AutonomousNavigator:
         else:
             command, decision, reason = VelocityCommand(0.0, 0.0, 0.0), "idle", "navigation disabled"
 
-        # Real-time SLAM: dead-reckon the pose and ray-cast the scan into the
-        # occupancy grid on every cycle, whether or not we are driving.
+        # Real-time SLAM: dead-reckon the pose from odometry / the last command
+        # here; the heavier occupancy-grid ray-cast runs off the event loop in
+        # run() via _update_slam().
         odom = self.stm32.status.odometry
         if isinstance(odom, (tuple, list)) and len(odom) == 3:
             self.slam.set_pose(*odom)
         elif command.vx or command.vy or command.wz:
             self.slam.update_from_motion(command.vx, command.vy, command.wz, dt=self.interval)
-        self.slam.update_from_lidar(
-            [{"angle_deg": p.angle_deg, "distance_m": p.distance_m} for p in scan]
-        )
 
         if proximity is not None:
             self.status.proximity = proximity
@@ -296,6 +294,12 @@ class AutonomousNavigator:
         }
         return self.state
 
+    def _update_slam(self, scan: list[ScanPoint]) -> None:
+        """Ray-cast the scan into the occupancy grid (runs in a worker thread)."""
+        self.slam.update_from_lidar(
+            [{"angle_deg": p.angle_deg, "distance_m": p.distance_m} for p in scan]
+        )
+
     async def run(self) -> None:
         """Continuous perception/control loop until cancelled."""
         last_heartbeat = 0.0
@@ -304,6 +308,7 @@ class AutonomousNavigator:
                 await self._refresh_camera()
                 scan = await asyncio.to_thread(self.lidar.read_scan)
                 self.step(scan)
+                await asyncio.to_thread(self._update_slam, scan)
                 now = time.monotonic()
                 if self.enabled and now - last_heartbeat >= 1.0:
                     self.stm32.send_heartbeat()

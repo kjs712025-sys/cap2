@@ -228,8 +228,141 @@ async function sendTextCommand() {
   }
 }
 
-// Voice commands are an external-app-only feature (POST /command/voice with a
-// recorded audio body). The dashboard intentionally does not record audio.
+// --- Voice command (LLM) -------------------------------------------------
+// Press the button to start capturing the microphone, press again to stop and
+// send. Audio is encoded to 16 kHz mono WAV client-side (a format Gemini
+// accepts directly) and POSTed to /command/voice. Manual mode only.
+let voiceRecording = false;
+let voiceCtx = null;
+let voiceStream = null;
+let voiceNode = null;
+let voiceSource = null;
+let voiceChunks = [];
+
+function setVoiceStatus(text) {
+  const el = $('voice-command-status');
+  if (el) el.textContent = text;
+}
+
+function encodeWav(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const w = (offset, str) => { for (let i = 0; i < str.length; i += 1) view.setUint8(offset + i, str.charCodeAt(i)); };
+  w(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  w(8, 'WAVE');
+  w(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);          // PCM
+  view.setUint16(22, 1, true);          // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  w(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i += 1) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    offset += 2;
+  }
+  return new Blob([view], { type: 'audio/wav' });
+}
+
+async function startVoiceCapture() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !AC) {
+    setVoiceStatus('이 브라우저/연결에서는 마이크를 쓸 수 없습니다 (HTTPS 또는 localhost 필요)');
+    return;
+  }
+  try {
+    voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    voiceChunks = [];
+    try { voiceCtx = new AC({ sampleRate: 16000 }); } catch (e) { voiceCtx = new AC(); }
+    voiceSource = voiceCtx.createMediaStreamSource(voiceStream);
+    voiceNode = voiceCtx.createScriptProcessor(4096, 1, 1);
+    voiceNode.onaudioprocess = (ev) => {
+      voiceChunks.push(new Float32Array(ev.inputBuffer.getChannelData(0)));
+    };
+    voiceSource.connect(voiceNode);
+    voiceNode.connect(voiceCtx.destination);
+  } catch (e) {
+    setVoiceStatus('마이크를 시작할 수 없습니다: ' + (e && e.name === 'NotAllowedError' ? '권한 거부됨' : (e.message || e.name)));
+    try { if (voiceStream) voiceStream.getTracks().forEach((t) => t.stop()); } catch (_) { /* ignore */ }
+    voiceCtx = voiceNode = voiceSource = voiceStream = null;
+    return;
+  }
+
+  voiceRecording = true;
+  const btn = $('voice-command-btn');
+  if (btn) { btn.classList.add('recording'); $('voice-btn-label').textContent = '⏹ 녹음 중 — 눌러서 전송'; }
+  setVoiceStatus('녹음 중… 말한 뒤 버튼을 다시 누르세요');
+}
+
+async function stopVoiceCaptureAndSend() {
+  voiceRecording = false;
+  const btn = $('voice-command-btn');
+  if (btn) { btn.classList.remove('recording'); $('voice-btn-label').textContent = '🎤 마이크 명령 시작'; }
+
+  const rate = voiceCtx ? voiceCtx.sampleRate : 16000;
+  try {
+    if (voiceNode) voiceNode.disconnect();
+    if (voiceSource) voiceSource.disconnect();
+    if (voiceStream) voiceStream.getTracks().forEach((t) => t.stop());
+    if (voiceCtx) await voiceCtx.close();
+  } catch (e) { /* ignore teardown errors */ }
+  voiceCtx = voiceNode = voiceSource = voiceStream = null;
+
+  const total = voiceChunks.reduce((n, c) => n + c.length, 0);
+  if (total < rate * 0.3) {           // < ~0.3 s captured
+    setVoiceStatus('녹음이 너무 짧습니다 — 다시 시도하세요');
+    return;
+  }
+  const merged = new Float32Array(total);
+  let off = 0;
+  for (const c of voiceChunks) { merged.set(c, off); off += c.length; }
+  voiceChunks = [];
+
+  const wav = encodeWav(merged, rate);
+  setVoiceStatus('전송 중… Gemini가 명령을 해석합니다');
+  $('text-command-result').textContent = 'thinking...';
+  try {
+    const response = await fetch('/command/voice', {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/wav' },
+      body: wav,
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.success) throw new Error(payload.message || 'voice command failed');
+    const m = payload.data?.motion || {};
+    setVoiceStatus(m.transcript ? `인식: "${m.transcript}"` : '음성을 인식하지 못했습니다');
+    showMotion(m);
+    refreshAll();
+  } catch (error) {
+    setVoiceStatus(`실패: ${error.message}`);
+    $('text-command-result').textContent = `failed: ${error.message}`;
+  }
+}
+
+let voiceBusy = false;
+async function toggleVoiceCommand() {
+  if (voiceBusy) return;                 // ignore rapid double-clicks
+  voiceBusy = true;
+  try {
+    if (!isManual()) {
+      setVoiceStatus('자율주행 모드입니다 — 수동조작으로 전환하세요');
+      return;
+    }
+    if (voiceRecording) {
+      await stopVoiceCaptureAndSend();
+    } else {
+      await startVoiceCapture();
+    }
+  } finally {
+    voiceBusy = false;
+  }
+}
 
 function refreshCameraFeed() {
   $('camera-feed').src = `/camera/stream?t=${Date.now()}`;
@@ -872,6 +1005,7 @@ async function pollNavState() {
 
 // --- Control mode: 'manual' | 'autonomous' -------------------------------
 let currentMode = 'manual';
+let modeRendered = null;
 
 function isManual() {
   return currentMode === 'manual';
@@ -879,6 +1013,8 @@ function isManual() {
 
 function applyControlMode(mode) {
   currentMode = mode;
+  if (modeRendered === mode) return;   // arrives ~4 Hz on the nav stream — only touch the DOM on a real change
+  modeRendered = mode;
   const manual = mode === 'manual';
 
   const manualBtn = $('mode-manual-btn');
@@ -909,6 +1045,22 @@ function applyControlMode(mode) {
   const textPanel = $('text-command-panel');
   if (motionPanel) motionPanel.classList.toggle('mode-locked', !manual);
   if (textPanel) textPanel.classList.toggle('mode-locked', !manual);
+
+  // Abandon any in-progress voice capture when leaving manual mode.
+  if (!manual && voiceRecording) {
+    voiceRecording = false;
+    try {
+      if (voiceNode) voiceNode.disconnect();
+      if (voiceSource) voiceSource.disconnect();
+      if (voiceStream) voiceStream.getTracks().forEach((t) => t.stop());
+      if (voiceCtx) voiceCtx.close();
+    } catch (e) { /* ignore */ }
+    voiceCtx = voiceNode = voiceSource = voiceStream = null;
+    voiceChunks = [];
+    const btn = $('voice-command-btn');
+    if (btn) { btn.classList.remove('recording'); const l = $('voice-btn-label'); if (l) l.textContent = '🎤 마이크 명령 시작'; }
+    setVoiceStatus('자율주행 모드로 전환됨 — 녹음 취소');
+  }
 }
 
 async function setControlMode(mode) {
@@ -981,6 +1133,7 @@ $('text-command-btn').addEventListener('click', sendTextCommand);
 $('text-command-input').addEventListener('keydown', (event) => {
   if (event.key === 'Enter') sendTextCommand();
 });
+$('voice-command-btn').addEventListener('click', toggleVoiceCommand);
 
 $('camera-refresh-btn').addEventListener('click', refreshCameraFeed);
 $('camera-capture-btn').addEventListener('click', captureCamera);

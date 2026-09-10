@@ -261,10 +261,9 @@ manual velocity** that streams to the STM32 and then auto-stops. These only
 work in `manual` control mode (see **Control mode** above); in `autonomous`
 mode they return `autonomous_active`:
 
-- POST `/command/voice` — raw audio body (`Content-Type` = the recorded MIME,
-  e.g. `audio/webm`); Gemini transcribes **and** interprets it. **External
-  apps only** — requests from the built-in dashboard page are rejected
-  (`voice_dashboard_blocked`).
+- POST `/command/voice` — raw audio body (`Content-Type` = the recorded MIME);
+  Gemini transcribes **and** interprets it. Used by both the dashboard and
+  external apps.
 - POST `/command/manual` — `{ "text": "왼쪽으로 천천히 돌아" }` — the
   dashboard's text box uses this.
 - POST `/command/stop` — cancel any active motion
@@ -275,8 +274,15 @@ transcript }`. `action` ∈ `move | turn | strafe | stop | none`. Every command
 is self-limiting — it never drives longer than `ROBOT_MANUAL_COMMAND_TIMEOUT`
 (default 4 s) and auto-stops after `duration_s`. Gemini even estimates the
 duration ("90도 돌아" → ~3 s at 0.5 rad/s). Without a key a Korean/English
-keyword fallback handles the common cases. The dashboard has a **🎤 Hold to
-speak** button next to the text box.
+keyword fallback handles the common cases.
+
+**Dashboard voice button** — the *Voice / text command* panel has a 🎤 button:
+click to start capturing the microphone, click again to stop and send. Audio is
+encoded to 16 kHz mono WAV in the browser (a format Gemini accepts directly)
+and POSTed to `/command/voice`. `getUserMedia` needs a **secure context**, so
+the mic works from `http://localhost:8000/app/` on the Pi or over HTTPS; to use
+it from a plain-HTTP LAN address, allowlist the origin in the browser
+(Chrome: `chrome://flags/#unsafely-treat-insecure-origin-as-secure`).
 
 `POST /camera/analyze` still uses Gemini for object/scene analysis.
 
@@ -320,8 +326,18 @@ the response is two-tier:
   but the robot keeps running. Only enable auto-stop with a vetted model and a
   properly aimed/focused camera.
 
+Independently of `auto_stop`, a warn-or-higher detection also **soft-halts**
+autonomous navigation (`fire_halt` — zero velocity + STM32 disarm, no e-stop
+latch) so it can be restarted from the dashboard once the view clears. To keep
+the noisy model from stop-and-go flapping the robot, this halt is debounced:
+it needs `ROBOT_FIRE_HALT_CONSECUTIVE` consecutive sightings (default `2`)
+before it disarms — the alert flag, dashboard siren and `robot/fire` topic
+still fire on the first frame. Set `ROBOT_FIRE_HALT_ON_DETECT=0` to drop the
+navigation halt entirely.
+
 Tune `ROBOT_FIRE_WARN_CONFIDENCE` / `ROBOT_FIRE_STOP_CONFIDENCE` /
-`ROBOT_FIRE_AUTO_STOP`, point `ROBOT_FIRE_MODEL_PATH` at a better model, or set
+`ROBOT_FIRE_AUTO_STOP` / `ROBOT_FIRE_HALT_CONSECUTIVE`, point
+`ROBOT_FIRE_MODEL_PATH` at a better model, or set
 `ROBOT_FIRE_MONITOR_ENABLED=0` to disable the monitor entirely. The
 Gemini-based `/camera/analyze` object analysis is unchanged and still requires
 `GEMINI_API_KEY`.

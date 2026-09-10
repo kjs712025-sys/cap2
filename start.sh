@@ -16,7 +16,7 @@ source .venv/bin/activate
 # importantly, lets the robot start with no internet: a transient PyPI failure
 # at boot logs a warning instead of aborting the service into a restart loop.
 # Force a re-install with:  rm .venv/.requirements.sha1
-if [ "${ROBOT_SKIP_PIP:-0}" != "1" ]; then
+if [ "${ROBOT_SKIP_PIP:-0}" != "1" ] && [ -f requirements.txt ]; then
   req_hash="$(sha1sum requirements.txt | cut -d' ' -f1)"
   stamp=".venv/.requirements.sha1"
   if [ "$(cat "$stamp" 2>/dev/null || true)" != "$req_hash" ]; then

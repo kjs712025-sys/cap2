@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0a0e10">
   <title>OmniBot Dashboard</title>
-  <link rel="stylesheet" href="/app/dashboard.css?v=13">
+  <link rel="stylesheet" href="/app/dashboard.css?v=14">
 </head>
 <body>
   <main class="shell">
@@ -149,7 +149,13 @@
       </section>
 
       <section class="panel" id="text-command-panel">
-        <div class="panel-heading"><h2>Text command (LLM)</h2><span class="badge manual-only-badge">manual only</span></div>
+        <div class="panel-heading"><h2>Voice / text command (LLM)</h2><span class="badge manual-only-badge">manual only</span></div>
+        <div class="voice-command-row">
+          <button id="voice-command-btn" class="voice-btn" type="button">
+            <span class="voice-dot"></span><span id="voice-btn-label">🎤 마이크 명령 시작</span>
+          </button>
+          <span id="voice-command-status" class="hw-detail">버튼을 누르고 말한 뒤 다시 눌러 전송</span>
+        </div>
         <div class="text-command-row">
           <input id="text-command-input" type="text" placeholder="예: 앞으로 가 / 왼쪽으로 돌아 / 멈춰" autocomplete="off">
           <button id="text-command-btn" class="icon-button" type="button">Send</button>
@@ -186,6 +192,6 @@
       </section>
     </div>
   </main>
-  <script src="/app/dashboard.js?v=13"></script>
+  <script src="/app/dashboard.js?v=14"></script>
 </body>
 </html>

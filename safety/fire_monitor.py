@@ -47,6 +47,7 @@ class FireMonitor:
         stop_confidence: float = 0.7,
         auto_stop: bool = False,
         halt_on_detect: bool = True,
+        halt_consecutive: int = 2,
         event_logger: Optional[EventLogger] = None,
         mqtt: Optional[Any] = None,
         navigator: Optional[Any] = None,
@@ -60,6 +61,12 @@ class FireMonitor:
         self.stop_confidence = stop_confidence
         self.auto_stop = auto_stop
         self.halt_on_detect = halt_on_detect
+        # This model false-positives on bright indoor light; require the
+        # detection to persist across this many consecutive checks before it
+        # actually halts autonomous driving (the alert / siren / MQTT still
+        # fire on the first sighting).
+        self.halt_consecutive = max(1, halt_consecutive)
+        self._actionable_streak = 0
         self.event_logger = event_logger
         self.mqtt = mqtt
         self.navigator = navigator
@@ -124,12 +131,14 @@ class FireMonitor:
         actionable = [d for d in detections if d.confidence >= self.warn_confidence]
 
         if not actionable:
+            self._actionable_streak = 0
             self.status.metadata.pop("fire_warning", None)
             self.status.metadata.pop("fire_alert", None)
             if self.latest["level"] != "clear":
                 self._record("clear", [])
             return {"detections": []}
 
+        self._actionable_streak += 1
         best = max(actionable, key=lambda detection: detection.confidence)
         if best.confidence >= self.stop_confidence and self.auto_stop:
             level = "stop"
@@ -155,9 +164,12 @@ class FireMonitor:
         }
 
     def _halt_for_fire(self, level: str, detection: Detection) -> None:
-        """Soft-stop the robot on any fire detection (does not latch e-stop)."""
+        """Soft-stop the robot on a persistent fire detection (does not latch
+        the e-stop). The alert flag is set immediately; the navigation halt
+        waits for ``halt_consecutive`` consecutive sightings to ride out the
+        model's lighting false-positives."""
         self.status.metadata["fire_alert"] = level
-        if not self.halt_on_detect:
+        if not self.halt_on_detect or self._actionable_streak < self.halt_consecutive:
             return
         navigator = self.navigator
         if navigator is not None and getattr(navigator, "enabled", False):

@@ -40,6 +40,9 @@ class RobotConfig:
     # it stops the robot and disarms but does not latch the emergency stop,
     # so navigation can be restarted from the dashboard once the view clears.
     fire_halt_on_detect: bool = True
+    # Consecutive actionable detections required before a fire soft-halts
+    # autonomous navigation (the alert / siren / MQTT still fire immediately).
+    fire_halt_consecutive: int = 2
     # The bundled model false-positives on blur / haze / bright light often
     # enough that autonomously halting on it is unsafe. Off by default: a
     # high-confidence detection is logged as "fire_stop_suppressed" instead of
@@ -140,6 +143,9 @@ class RobotConfig:
             ),
             fire_auto_stop=os.getenv("ROBOT_FIRE_AUTO_STOP", "0") == "1",
             fire_halt_on_detect=os.getenv("ROBOT_FIRE_HALT_ON_DETECT", "1") == "1",
+            fire_halt_consecutive=int(
+                os.getenv("ROBOT_FIRE_HALT_CONSECUTIVE", defaults.fire_halt_consecutive)
+            ),
             lidar_port=os.getenv("ROBOT_LIDAR_PORT", defaults.lidar_port),
             lidar_model=os.getenv("ROBOT_LIDAR_MODEL", defaults.lidar_model),
             nav_interval=float(os.getenv("ROBOT_NAV_INTERVAL", defaults.nav_interval)),

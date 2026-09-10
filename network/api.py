@@ -244,7 +244,7 @@ async def motion_command(request: Request) -> dict[str, Any]:
     if lidar is not None:
         scan = await asyncio.to_thread(lidar.read_scan)
         points = [{"angle_deg": point.angle_deg, "distance_m": point.distance_m} for point in scan]
-        request.app.state.slam.update_from_lidar(points)
+        await asyncio.to_thread(request.app.state.slam.update_from_lidar, points)
 
     if hasattr(request.app.state, "stm32"):
         request.app.state.stm32.send_velocity(VelocityCommand(vx, vy, wz))
@@ -266,15 +266,15 @@ async def text_command(request: Request) -> dict[str, Any]:
 async def voice_command(request: Request) -> dict[str, Any]:
     """Transcribe spoken audio with Gemini and drive the robot (timed manual teleop).
 
-    Voice control is an external-app feature — requests coming from the
-    built-in dashboard page are rejected (use POST /command/manual there).
+    Available to the dashboard and to external apps, but only in ``manual``
+    control mode.
     """
-    if "/app/" in request.headers.get("referer", ""):
-        return error("voice commands are only available to external clients", code="voice_dashboard_blocked")
     blocked = _manual_blocked(request)
     if blocked is not None:
         return blocked
     audio_data = await request.body()
+    if not audio_data:
+        return error("empty audio body", code="no_audio")
     mime_type = request.headers.get("content-type", "audio/wav").split(";", 1)[0]
     motion = await request.app.state.assistant.drive_from_voice(audio_data, mime_type=mime_type)
     return success({"motion": motion, "intent": motion}, message="voice_command")

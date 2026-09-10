@@ -116,6 +116,7 @@ def create_app(config: RobotConfig) -> FastAPI:
         stop_confidence=config.fire_stop_confidence,
         auto_stop=config.fire_auto_stop,
         halt_on_detect=config.fire_halt_on_detect,
+        halt_consecutive=config.fire_halt_consecutive,
         event_logger=event_logger,
         mqtt=mqtt,
     )
@@ -199,8 +200,11 @@ def create_app(config: RobotConfig) -> FastAPI:
             # first real scan before the robot starts driving itself on boot.
             async def _autostart_navigation() -> None:
                 await asyncio.sleep(max(0.0, config.nav_autostart_delay))
-                if app.state.status.mode is RobotMode.ERROR:
-                    logger.warning("Skipping navigation auto-start: robot is in an error state")
+                status = app.state.status
+                if status.mode is RobotMode.ERROR or status.metadata.get("fire_alert"):
+                    logger.warning(
+                        "Skipping navigation auto-start: robot is in an error/fire state"
+                    )
                     return
                 navigator.enable()
                 logger.info(
