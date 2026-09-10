@@ -171,6 +171,7 @@ input:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ---- emergency ---- */
 .estop-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.estop-buttons { display: flex; align-items: center; gap: 10px; }
 .hint { color: var(--muted); font-size: 12px; line-height: 1.5; }
 .stop-button {
   padding: 11px 20px; border: 1px solid rgba(255, 122, 102, 0.5); border-radius: 999px;

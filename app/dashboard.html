@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0a0e10">
   <title>OmniBot Dashboard</title>
-  <link rel="stylesheet" href="/app/dashboard.css?v=14">
+  <link rel="stylesheet" href="/app/dashboard.css?v=15">
 </head>
 <body>
   <main class="shell">
@@ -166,8 +166,11 @@
       <section class="panel">
         <div class="panel-heading"><h2>Emergency control</h2></div>
         <div class="estop-row">
-          <p class="hint">Immediately halts motion and latches STM32 velocity commands.</p>
-          <button id="stop-button" class="stop-button" type="button">Emergency stop</button>
+          <p class="hint">Immediately halts motion and latches STM32 velocity commands. Clear resets to manual mode after a safety check.</p>
+          <div class="estop-buttons">
+            <button id="stop-button" class="stop-button" type="button">Emergency stop</button>
+            <button id="stop-clear-button" class="icon-button" type="button">Clear</button>
+          </div>
         </div>
         <p id="error" class="error" role="alert"></p>
       </section>
@@ -192,6 +195,6 @@
       </section>
     </div>
   </main>
-  <script src="/app/dashboard.js?v=14"></script>
+  <script src="/app/dashboard.js?v=15"></script>
 </body>
 </html>

@@ -173,6 +173,18 @@ async function emergencyStop() {
   }
 }
 
+async function clearEmergencyStop() {
+  $('error').textContent = '';
+  try {
+    const response = await fetch('/emergency-stop/clear', { method: 'POST' });
+    const payload = await response.json();
+    if (!response.ok || !payload.success) throw new Error(payload.message || 'clear failed');
+    pollNavState();
+  } catch (error) {
+    $('error').textContent = 'Emergency-stop clear failed.';
+  }
+}
+
 async function sendMotion(vx, vy, wz) {
   if (!isManual()) {
     $('motion-result').textContent = '자율주행 모드입니다 — 수동조작으로 전환하세요';
@@ -1117,6 +1129,7 @@ function connectWebSocket() {
 startRadarLoop();
 
 $('stop-button').addEventListener('click', emergencyStop);
+$('stop-clear-button').addEventListener('click', clearEmergencyStop);
 $('refresh-button').addEventListener('click', refreshAll);
 
 document.querySelectorAll('.dpad-btn[data-vx]').forEach((button) => {

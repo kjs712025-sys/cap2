@@ -99,6 +99,7 @@ async def api_info(request: Request) -> dict[str, Any]:
                 "stop": "POST /command/stop",
                 "autonomy": "POST /navigation/start | /navigation/stop",
                 "emergency_stop": "POST /emergency-stop",
+                "emergency_clear": "POST /emergency-stop/clear",
             },
         },
         message="api_info",
@@ -515,10 +516,39 @@ async def camera_stream(request: Request) -> StreamingResponse:
 
 
 @router.post("/emergency-stop")
-async def emergency_stop(request: Request) -> dict[str, str]:
+async def emergency_stop(request: Request) -> dict[str, Any]:
     """Trigger a software emergency stop."""
     logger.warning("Emergency stop requested via API")
+    navigator = getattr(request.app.state, "navigator", None)
+    if navigator is not None:
+        navigator.disable()  # stop autonomous driving; operator must re-arm it
     if hasattr(request.app.state, "stm32"):
         request.app.state.stm32.emergency_stop()
     request.app.state.status.set_mode(RobotMode.ERROR)
     return success({"status": "emergency_stop"}, message="emergency_stop")
+
+
+@router.post("/emergency-stop/clear")
+async def clear_emergency_stop(request: Request) -> dict[str, Any]:
+    """Release the emergency-stop latch after an operator safety check.
+
+    Unlatches the STM32, clears the fire flags, and returns the robot to
+    ``manual`` mode (stationary) so the operator can drive or re-arm autonomy.
+    """
+    state = request.app.state
+    stm32 = getattr(state, "stm32", None)
+    if stm32 is not None:
+        stm32.clear_emergency_stop()
+    status = state.status
+    status.metadata.pop("fire_detected", None)
+    status.metadata.pop("fire_alert", None)
+    status.last_error = None
+    if status.mode is RobotMode.ERROR:
+        status.set_mode(RobotMode.MANUAL)
+        status.mission = "ready"
+        status.ai_state = "standby"
+    fire_monitor = getattr(state, "fire_monitor", None)
+    if fire_monitor is not None:
+        fire_monitor.triggered = False
+    logger.info("Emergency stop latch cleared via API")
+    return success({"mode": _control_mode(request)}, message="emergency_cleared")

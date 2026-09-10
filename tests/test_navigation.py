@@ -157,6 +157,27 @@ def test_mode_switch_gates_manual_control() -> None:
     assert client.post("/mode", json={"mode": "sideways"}).json()["error"] == "bad_mode"
 
 
+def test_emergency_stop_and_clear_round_trip() -> None:
+    from robot.status import RobotMode
+
+    app = create_app(RobotConfig(debug=True, llm_enabled=False, enable_websocket=False))
+    client = TestClient(app)
+
+    client.post("/mode", json={"mode": "auto"})           # start autonomous driving
+    assert client.get("/mode").json()["data"]["mode"] == "autonomous"
+
+    assert client.post("/emergency-stop").json()["success"] is True
+    assert app.state.status.mode is RobotMode.ERROR
+    assert app.state.navigator.enabled is False           # estop also drops autonomy
+    # manual control is refused while latched
+    assert client.post("/motion/command", json={"vx": 0.1, "vy": 0, "wz": 0}).json()["error"] == "emergency_latched"
+
+    cleared = client.post("/emergency-stop/clear").json()
+    assert cleared["success"] is True and cleared["data"]["mode"] == "manual"   # not back to autonomous
+    assert app.state.status.mode is RobotMode.MANUAL
+    assert client.post("/motion/command", json={"vx": 0.0, "vy": 0, "wz": 0}).json()["success"] is True
+
+
 def test_fire_state_endpoint_returns_mqtt_payload() -> None:
     app = create_app(RobotConfig(debug=True, llm_enabled=False, enable_websocket=False))
     client = TestClient(app)

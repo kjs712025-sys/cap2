@@ -121,7 +121,21 @@ The autonomous navigator arms the board on `/navigation/start`, streams
 velocity setpoints + heartbeats each cycle, and disarms on `/navigation/stop`
 or an emergency stop. If the board is absent or drops mid-drive the link is
 marked down and retried on a 3 s backoff — the control loop never blocks.
-- POST `/emergency-stop`
+
+The matching STM32 firmware is [`firmware/omnibot_stm32/`](firmware/omnibot_stm32/)
+— an Arduino sketch for a NUCLEO-F411RE driving two AM-DC2-2D dual motor
+drivers (4-wheel omni). It does the omni mixing, a comms watchdog, and `S`/`B`
+telemetry; see that folder's README for wiring and the bench-calibration steps.
+- POST `/emergency-stop` — halt, drop autonomy, latch `error` mode
+- POST `/emergency-stop/clear` — release the latch after a safety check, back to
+  stationary `manual` mode (autonomy is not auto-resumed)
+
+### Android app
+
+A native remote-control client (mirrors the dashboard) lives under
+[`app-android/`](app-android/). `app-android/AGENT_PROMPT.md` is a
+self-contained brief — the full REST/SSE/MJPEG API, screen list, and
+implementation notes — to hand to a coding agent in Android Studio.
 
 ### Camera
 - POST `/camera/capture`
