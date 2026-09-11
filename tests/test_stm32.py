@@ -68,6 +68,27 @@ def test_stm32_parser_handles_messages() -> None:
     assert messages[1]["payload"] == "stall"
 
 
+def test_poll_retries_connection_when_link_is_down() -> None:
+    """A transient USB drop must recover on its own: poll() runs every
+    perception cycle whether or not the robot is armed, so it has to retry
+    the connection itself rather than only reconnecting opportunistically
+    when something happens to write a command."""
+    controller = STM32Controller(RobotConfig(debug=True))
+    assert controller.serial is None
+
+    with patch("robot.stm32.serial.Serial") as serial_cls:
+        serial_instance = MagicMock()
+        serial_instance.is_open = True
+        serial_instance.in_waiting = 0
+        serial_instance.read.return_value = b""
+        serial_cls.return_value = serial_instance
+
+        controller.poll()
+
+    assert controller.status.connected is True
+    assert controller.serial is serial_instance
+
+
 def test_stm32_connect_uses_serial_port_when_available() -> None:
     controller = STM32Controller(RobotConfig(debug=True))
 

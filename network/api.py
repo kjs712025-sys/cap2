@@ -197,6 +197,8 @@ async def diagnostics(request: Request) -> dict[str, Any]:
                     "connected": stm32_connected,
                     "armed": bool(getattr(stm32_status, "armed", False)),
                     "battery_voltage": getattr(stm32_status, "battery_voltage", None),
+                    "board_status": getattr(stm32_status, "board_status", None),
+                    "odometry": getattr(stm32_status, "odometry", None),
                     "last_error": getattr(stm32_status, "last_error", None),
                 },
                 "camera": {

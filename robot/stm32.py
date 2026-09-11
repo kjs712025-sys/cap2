@@ -203,7 +203,16 @@ class STM32Controller:
         return {"kind": parts[0], "payload": ",".join(parts[1:])}
 
     def read_messages(self) -> list[dict[str, str]]:
-        """Read pending serial bytes and return parsed frames."""
+        """Read pending serial bytes and return parsed frames.
+
+        Also retries the connection (subject to the reconnect backoff) so a
+        transient USB drop recovers even while the robot is idle and nothing
+        is writing to the link — poll() is called every perception cycle
+        regardless of arm state, so this is the only regular opportunity to
+        notice the port came back.
+        """
+        if not self.serial or not self.serial.is_open:
+            self.connect()
         if self.serial and self.serial.is_open:
             try:
                 data = self.serial.read(self.serial.in_waiting or 64).decode("utf-8", errors="ignore")
