@@ -1,30 +1,23 @@
 [Unit]
-Description=AI Robot Backend (FastAPI + camera + lidar + navigation)
-Documentation=https://github.com/local/sung-jin
-After=network-online.target mosquitto.service
-Wants=network-online.target mosquitto.service
-# Never stop trying to bring the robot back up.
-StartLimitIntervalSec=0
+Description=OmniBot Dashboard and Backend
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/meka/sung-jin
-ExecStart=/home/meka/sung-jin/start.sh
-Restart=always
-RestartSec=5
-User=meka
-SupplementaryGroups=dialout video
+WorkingDirectory=/home/meka/.copilot/chats/a183ea76-71db-4dd7-a682-958de50c39ec/cap2-main
+EnvironmentFile=/home/meka/.copilot/chats/a183ea76-71db-4dd7-a682-958de50c39ec/cap2-main/.env
 Environment=ROBOT_HOST=0.0.0.0
 Environment=ROBOT_PORT=8000
-Environment=ROBOT_DEBUG=1
-Environment=ROBOT_FIRE_MONITOR_ENABLED=1
-# Start driving autonomously on boot. ROBOT_NAV_AUTOSTART actually enables the
-# navigator; the delay lets the LiDAR/camera come up first. Set both to 0 to
-# boot in manual mode instead.
-Environment=ROBOT_AUTOSTART_AUTONOMOUS=1
-Environment=ROBOT_NAV_AUTOSTART=1
-Environment=ROBOT_NAV_AUTOSTART_DELAY=8
+Environment=ROBOT_AUTOSTART_AUTONOMOUS=0
+Environment=ROBOT_NAV_AUTOSTART=0
+Environment=ROBOT_SKIP_PIP=1
 Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/meka/.copilot/chats/a183ea76-71db-4dd7-a682-958de50c39ec/cap2-main/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+User=meka
+SupplementaryGroups=dialout
 
 [Install]
 WantedBy=multi-user.target

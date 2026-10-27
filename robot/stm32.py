@@ -22,6 +22,7 @@ so a hot control loop never blocks on a missing device.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -62,11 +63,17 @@ class STM32Controller:
         self.emergency_latched = False
         self._next_reconnect_at = 0.0
         self._last_command = VelocityCommand(0.0, 0.0, 0.0)
+        self._simulation_pose = (0.0, 0.0, 0.0)
+        self._simulation_updated_at = time.monotonic()
 
     # -- connection --------------------------------------------------------
 
     def connect(self) -> None:
         """Open the UART link, backing off between repeated failures."""
+        if self.config.simulation:
+            self.status.connected = True
+            self.status.last_error = None
+            return
         if self.serial and self.serial.is_open:
             self.status.connected = True
             return
@@ -105,6 +112,13 @@ class STM32Controller:
 
     def initialize(self) -> None:
         """Attempt to connect to the STM32 on startup."""
+        if self.config.simulation:
+            self.status.connected = True
+            self.status.battery_voltage = 12.4
+            self.status.board_status = "simulation"
+            self._simulation_updated_at = time.monotonic()
+            logger.info("Using simulated STM32; no physical device will be opened")
+            return
         self.connect()
 
     def _mark_link_down(self, exc: Exception) -> None:
@@ -124,6 +138,8 @@ class STM32Controller:
 
     def _write(self, payload: str) -> bool:
         """Send one frame; return whether it actually went out."""
+        if self.config.simulation:
+            return True
         if not self.serial or not self.serial.is_open:
             self.connect()
         if not self.serial or not self.serial.is_open:
@@ -211,6 +227,8 @@ class STM32Controller:
         regardless of arm state, so this is the only regular opportunity to
         notice the port came back.
         """
+        if self.config.simulation:
+            return []
         if not self.serial or not self.serial.is_open:
             self.connect()
         if self.serial and self.serial.is_open:
@@ -232,6 +250,19 @@ class STM32Controller:
 
     def poll(self) -> list[dict[str, str]]:
         """Read STM32 telemetry frames and fold them into ``self.status``."""
+        if self.config.simulation:
+            now = time.monotonic()
+            dt = min(now - self._simulation_updated_at, 1.0)
+            self._simulation_updated_at = now
+            x, y, yaw = self._simulation_pose
+            command = self._last_command
+            x += (command.vx * math.cos(yaw) - command.vy * math.sin(yaw)) * dt
+            y += (command.vx * math.sin(yaw) + command.vy * math.cos(yaw)) * dt
+            yaw = (yaw + command.wz * dt + math.pi) % (2 * math.pi) - math.pi
+            self._simulation_pose = (x, y, yaw)
+            self.status.odometry = self._simulation_pose
+            self.status.board_status = "simulation"
+            return []
         messages = self.read_messages()
         for message in messages:
             kind = message.get("kind", "")

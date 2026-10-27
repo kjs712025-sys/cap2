@@ -23,6 +23,9 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .shell { width: min(100% - 32px, 620px); margin: 0 auto; padding: 28px 0 44px; }
 .topbar, .panel-heading, .command-value, .connection { display: flex; align-items: center; }
 .topbar { justify-content: space-between; margin-bottom: 22px; }
+.topbar-actions { display: flex; align-items: center; gap: 14px; }
+.dashboard-link { color: var(--accent); font: 500 11px 'DM Mono', monospace; text-decoration: none; }
+.dashboard-link:hover { text-decoration: underline; }
 .eyebrow { margin: 0 0 8px; color: var(--accent); font: 500 11px 'DM Mono', monospace; letter-spacing: 0; }
 h1, h2, p { margin: 0; }
 h1 { font-size: clamp(26px, 7vw, 40px); line-height: 1.05; letter-spacing: 0; }

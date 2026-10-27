@@ -36,27 +36,56 @@ function updateStatus(status) {
   $('safe-direction').textContent = status.safe_direction || '--';
   $('heartbeat').textContent = status.heartbeat != null ? status.heartbeat : '--';
 
+  const fireAvailableInPayload = Object.prototype.hasOwnProperty.call(status, 'fire')
+    || status.metadata?.fire_detected
+    || status.metadata?.fire_warning;
+  if (!fireAvailableInPayload) return;
   const fire = status.fire || (status.metadata && (status.metadata.fire_detected ? 'detected' : status.metadata.fire_warning)) || 'clear';
   const fireEl = $('fire');
   if (fireEl) {
-    fireEl.textContent = fire;
-    fireEl.style.color = fire === 'detected' ? 'var(--alert)' : (fire !== 'clear' ? 'var(--warn)' : '');
+    fireEl.textContent = fire === 'unavailable' ? 'unavailable · no camera' : fire;
+    fireEl.style.color = fire === 'detected' ? 'var(--alert)' : (fire === 'unavailable' ? 'var(--muted)' : (fire !== 'clear' ? 'var(--warn)' : ''));
   }
+}
+
+function updateSystem(system) {
+  if (!system) return;
+  $('system-cpu-load').textContent = system.cpu_load_1m == null ? 'unavailable' : `${system.cpu_load_1m}%`;
+  $('system-cpu-temp').textContent = system.cpu_temperature_c == null ? 'unavailable' : `${system.cpu_temperature_c} C`;
+  $('system-memory').textContent = system.memory_available_mb == null ? 'unavailable' : `${system.memory_available_mb} MB`;
+  $('system-disk').textContent = system.disk_free_gb == null ? 'unavailable' : `${system.disk_free_gb} GB`;
+}
+
+function updateFireMonitor(monitor) {
+  if (!monitor) return;
+  const states = {
+    simulation: ['SIMULATION · NOT MONITORING', '시뮬레이션 영상은 화재 분석에 사용되지 않습니다. 실제 카메라와 검증된 화재 감지 모델이 필요합니다.'],
+    disabled: ['DISABLED', '화재 감시가 설정에서 꺼져 있습니다.'],
+    no_camera: ['NO CAMERA', '카메라가 연결되지 않아 화재 감시를 시작할 수 없습니다.'],
+    monitoring: ['MONITORING', '화재 감시가 활성화되어 있습니다.'],
+  };
+  const [label, detail] = states[monitor.state] || ['UNAVAILABLE', '화재 감시 상태를 확인할 수 없습니다.'];
+  $('fire-monitor-state').textContent = label;
+  $('fire-monitor-detail').textContent = detail;
 }
 
 function updateHardware(hardware) {
   if (!hardware) return;
+  const simulated = !!hardware.simulation;
+  $('simulation-badge').hidden = !simulated;
+  updateSystem(hardware.system);
+  updateFireMonitor(hardware.fire_monitor);
   const stm32 = hardware.stm32 || {};
   setBadge('stm32-badge', !!stm32.connected);
-  $('stm32-detail').textContent = stm32.last_error ? `error: ${stm32.last_error}` : (stm32.connected ? 'connected' : 'not connected');
+  $('stm32-detail').textContent = simulated ? 'simulated controller · no physical device' : (stm32.last_error ? `error: ${stm32.last_error}` : (stm32.connected ? 'connected' : 'not connected'));
 
   const camera = hardware.camera || {};
   setBadge('camera-badge', !!camera.ready);
-  $('camera-detail').textContent = `source: ${camera.source || 'unknown'}`;
+  $('camera-detail').textContent = simulated ? 'virtual camera · no physical device' : `source: ${camera.source || 'unknown'}`;
 
   const lidar = hardware.lidar || {};
   setBadge('lidar-badge', !!lidar.ready);
-  $('lidar-detail').textContent = `port: ${lidar.port || 'unknown'}`;
+  $('lidar-detail').textContent = simulated ? 'virtual room scan · no physical device' : `port: ${lidar.port || 'unknown'}`;
 }
 
 function updateRobotName(name) {
@@ -101,7 +130,12 @@ async function fetchDiagnostics() {
     const payload = await response.json();
     const components = payload.data?.components;
     if (!components) return;
-    updateHardware(components);
+    updateHardware({
+      ...components,
+      simulation: payload.data.simulation,
+      system: payload.data.system,
+      fire_monitor: components.fire_monitor,
+    });
     const llm = components.llm;
     if (llm) {
       setBadge('llm-badge', !!llm.ready);
@@ -160,7 +194,7 @@ async function fetchAlerts() {
 }
 
 async function refreshAll() {
-  await Promise.all([fetchUptime(), fetchEvents(), fetchAlerts(), fetchDiagnostics(), fetchTelemetry()]);
+  await Promise.all([fetchUptime(), fetchEvents(), fetchAlerts(), fetchDiagnostics(), fetchTelemetry(), pollNav2State()]);
 }
 
 async function emergencyStop() {
@@ -199,10 +233,62 @@ async function sendMotion(vx, vy, wz) {
     });
     const payload = await response.json();
     if (!response.ok || !payload.success) throw new Error(payload.message || 'Motion command failed');
-    $('motion-result').textContent = `sent vx=${vx} vy=${vy} wz=${wz}`;
+    const command = payload.data?.command || { vx, vy, wz };
+    $('motion-result').textContent = `sent vx=${command.vx} vy=${command.vy} wz=${command.wz}`;
   } catch (error) {
     $('motion-result').textContent = `failed: ${error.message}`;
   }
+}
+
+let motionCommandQueue = Promise.resolve();
+function queueMotion(vx, vy, wz) {
+  motionCommandQueue = motionCommandQueue.catch(() => {}).then(() => sendMotion(vx, vy, wz));
+  return motionCommandQueue;
+}
+
+let dpadRepeatTimer = null;
+let dpadReleaseTimer = null;
+let dpadActiveButton = null;
+let dpadStartedAt = 0;
+const MIN_DPAD_RUN_MS = 450;
+
+function stopDpadMotion() {
+  clearTimeout(dpadReleaseTimer);
+  dpadReleaseTimer = null;
+  clearInterval(dpadRepeatTimer);
+  dpadRepeatTimer = null;
+  if (!dpadActiveButton) return Promise.resolve();
+  dpadActiveButton = null;
+  dpadStartedAt = 0;
+  if (isManual()) return queueMotion(0, 0, 0);
+  return Promise.resolve();
+}
+
+function releaseDpadMotion() {
+  if (!dpadActiveButton || dpadReleaseTimer) return;
+  const remaining = MIN_DPAD_RUN_MS - (performance.now() - dpadStartedAt);
+  if (remaining > 0) {
+    dpadReleaseTimer = setTimeout(() => {
+      dpadReleaseTimer = null;
+      stopDpadMotion();
+    }, remaining);
+    return;
+  }
+  stopDpadMotion();
+}
+
+function startDpadMotion(button) {
+  if (!isManual() || button.disabled) return;
+  stopDpadMotion();
+  dpadActiveButton = button;
+  dpadStartedAt = performance.now();
+  const command = () => queueMotion(
+    Number(button.dataset.vx),
+    Number(button.dataset.vy),
+    Number(button.dataset.wz),
+  );
+  command();
+  dpadRepeatTimer = setInterval(command, 150);
 }
 
 function showMotion(m) {
@@ -409,10 +495,11 @@ async function analyzeCamera() {
 let slamState = null;
 let slamEventSource = null;
 let slamRafRunning = false;
+let rosSlamMap = null;
 
-function decodeSlamGrid(b64, size) {
+function decodeSlamGrid(b64, cellCount) {
   const bin = atob(b64);
-  const cells = new Uint8Array(size * size);
+  const cells = new Uint8Array(cellCount);
   for (let i = 0; i < cells.length; i += 1) cells[i] = bin.charCodeAt(i);
   return cells;
 }
@@ -441,7 +528,7 @@ function drawSlam(slam) {
   }
 
   const size = slam.size;
-  const cells = slam.__cells || decodeSlamGrid(slam.grid_b64, size);
+  const cells = slam.__cells || decodeSlamGrid(slam.grid_b64, size * size);
   slam.__cells = cells;
   const px = cssW / size;
   const res = slam.resolution_m;
@@ -936,8 +1023,6 @@ function renderNavState(nav) {
   const batEl = $('nav-battery');
   if (batEl) batEl.textContent = stm32.battery_voltage != null ? `${stm32.battery_voltage} V` : '--';
 
-  applyControlMode(nav.enabled ? 'autonomous' : 'manual');
-
   updateFireAlert(nav.fire);
 
   const cam = nav.camera || {};
@@ -1015,6 +1100,266 @@ async function pollNavState() {
   }
 }
 
+async function nav2Request(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload.success) {
+    throw new Error(payload.message || payload.error || `Request failed (${response.status})`);
+  }
+  return payload.data || {};
+}
+
+function showNav2Message(message, isError = false) {
+  const el = $('nav2-message');
+  if (!el) return;
+  el.textContent = message;
+  el.classList.toggle('error', isError);
+  el.classList.toggle('success', !isError);
+}
+
+async function pollNav2State() {
+  try {
+    const state = await nav2Request('/nav2/state');
+    const control = await nav2Request('/mode');
+    applyControlMode(control.mode);
+    const badge = $('nav2-stack-state');
+    badge.textContent = state.running ? `running · PID ${state.pid}` : 'not running';
+    badge.classList.toggle('online', !!state.running);
+    badge.classList.toggle('offline', !state.running);
+    $('nav2-start-btn').disabled = !!state.running;
+    $('nav2-stop-btn').disabled = !state.running;
+    $('mode-auto-btn').disabled = !state.running && !state.control_claimed;
+    $('nav2-arm-btn').disabled = !state.running || !!state.armed || !state.lidar_ready || !state.stm32_connected
+      || (!state.simulation && (!state.slam_running || !state.ros_map_ready));
+    $('nav2-release-btn').disabled = !state.control_claimed;
+    $('nav2-goal-btn').disabled = !state.running || !state.control_claimed || !state.armed;
+    $('nav2-cancel-btn').disabled = !state.control_claimed;
+    const slamBadge = $('ros-slam-state');
+    slamBadge.textContent = state.slam_running ? 'running' : 'stopped';
+    slamBadge.classList.toggle('online', !!state.slam_running);
+    slamBadge.classList.toggle('offline', !state.slam_running);
+    $('ros-slam-start-btn').disabled = !!state.slam_running;
+    $('ros-slam-stop-btn').disabled = !state.slam_running;
+    $('ros-slam-save-btn').disabled = !state.slam_running || !state.ros_map_ready;
+    if (state.slam_running) {
+      $('ros-slam-message').textContent = state.ros_map_ready
+        ? `ROS /map live${state.ros_map_age_seconds == null ? '' : ` · updated ${state.ros_map_age_seconds.toFixed(1)} s ago`}${$('ros-slam-yaml-link').hidden ? '' : ' · saved map ready to download'}`
+        : 'SLAM running; waiting for a fresh ROS /map.';
+    } else {
+      $('ros-slam-message').textContent = 'SLAM Toolbox is stopped. Start it to receive and display the ROS map.';
+    }
+    if (!state.running && !state.workspace_built) {
+      showNav2Message('Nav2 workspace not built. Build ros2_ws before starting.', true);
+    } else if (!state.running && state.last_exit_code != null && state.last_exit_code !== 0) {
+      showNav2Message(`Nav2 exited (${state.last_exit_code}); see logs/nav2.log.`, true);
+    } else if (state.armed) {
+      showNav2Message('Nav2 controls the robot. Open-loop odometry can drift; supervise continuously.');
+    } else if (state.control_claimed) {
+      showNav2Message(state.lidar_ready ? 'Control reserved; motors disarmed.' : 'Waiting for a fresh physical LiDAR scan.');
+    } else if (state.running) {
+      showNav2Message('Nav2 is running. Verify scan/map and clear the robot area before claiming control.');
+    } else {
+      showNav2Message('Nav2 is stopped. Starting the stack does not move or arm the robot.');
+    }
+  } catch (error) {
+    showNav2Message(`Nav2 status unavailable: ${error.message}`, true);
+  }
+}
+
+function drawRosSlamMap(map) {
+  const canvas = $('ros-slam-canvas');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const cssWidth = canvas.clientWidth || 420;
+  const cssHeight = canvas.clientHeight || 420;
+  const pixelWidth = Math.round(cssWidth * dpr);
+  const pixelHeight = Math.round(cssHeight * dpr);
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#0c1213';
+  ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+  if (!map?.grid_b64 || !Number.isInteger(map.width) || !Number.isInteger(map.height)) {
+    ctx.fillStyle = '#78908a';
+    ctx.font = '13px system-ui, sans-serif';
+    ctx.fillText('waiting for ROS /map…', 16, 24);
+    return;
+  }
+  const size = map.width * map.height;
+  const cells = map.__cells || decodeSlamGrid(map.grid_b64, size);
+  map.__cells = cells;
+  const image = ctx.createImageData(map.width, map.height);
+  for (let row = 0; row < map.height; row += 1) {
+    for (let column = 0; column < map.width; column += 1) {
+      const source = row * map.width + column;
+      const value = cells[source] > 127 ? cells[source] - 256 : cells[source];
+      const dest = ((map.height - 1 - row) * map.width + column) * 4;
+      if (value < 0) {
+        image.data[dest] = 45; image.data[dest + 1] = 57; image.data[dest + 2] = 59; image.data[dest + 3] = 255;
+      } else {
+        const shade = Math.round(235 - value * 1.8);
+        image.data[dest] = shade; image.data[dest + 1] = shade; image.data[dest + 2] = shade; image.data[dest + 3] = 255;
+      }
+    }
+  }
+  const offscreen = document.createElement('canvas');
+  offscreen.width = map.width;
+  offscreen.height = map.height;
+  offscreen.getContext('2d').putImageData(image, 0, 0);
+  const scale = Math.min(cssWidth / map.width, cssHeight / map.height);
+  const drawWidth = map.width * scale;
+  const drawHeight = map.height * scale;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(offscreen, (cssWidth - drawWidth) / 2, (cssHeight - drawHeight) / 2, drawWidth, drawHeight);
+}
+
+async function pollRosSlamMap() {
+  try {
+    const result = await nav2Request('/nav2/slam/map');
+    rosSlamMap = result.available ? result.map : null;
+    drawRosSlamMap(rosSlamMap);
+    const age = result.age_seconds;
+    $('ros-slam-map-caption').textContent = rosSlamMap
+      ? `${rosSlamMap.width} × ${rosSlamMap.height} cells · ${rosSlamMap.resolution_m.toFixed(2)} m/cell${age == null ? '' : ` · ${age.toFixed(1)} s ago`}`
+      : 'ROS /map occupancy grid';
+  } catch (error) {
+    $('ros-slam-message').textContent = `ROS map unavailable: ${error.message}`;
+  }
+}
+
+async function startRosSlam() {
+  $('ros-slam-start-btn').disabled = true;
+  try {
+    const result = await nav2Request('/nav2/slam/start', { method: 'POST' });
+    $('ros-slam-message').textContent = result.message || 'ROS SLAM Toolbox started.';
+  } catch (error) {
+    $('ros-slam-message').textContent = error.message;
+  }
+  await Promise.all([pollNav2State(), pollRosSlamMap()]);
+}
+
+async function stopRosSlam() {
+  if (!window.confirm('ROS 2 SLAM Toolbox를 종료할까요? Nav2 제어권이 활성화되어 있으면 먼저 해제해야 합니다.')) return;
+  $('ros-slam-stop-btn').disabled = true;
+  try {
+    const result = await nav2Request('/nav2/slam/stop', { method: 'POST' });
+    $('ros-slam-message').textContent = result.message || 'ROS SLAM Toolbox stopped.';
+    $('ros-slam-yaml-link').hidden = true;
+    $('ros-slam-image-link').hidden = true;
+  } catch (error) {
+    $('ros-slam-message').textContent = error.message;
+  }
+  await Promise.all([pollNav2State(), pollRosSlamMap()]);
+}
+
+async function saveRosSlamMap() {
+  $('ros-slam-save-btn').disabled = true;
+  $('ros-slam-message').textContent = 'Saving ROS map…';
+  try {
+    const result = await nav2Request('/nav2/slam/map/save', { method: 'POST', body: '{}' });
+    $('ros-slam-yaml-link').href = result.yaml_url;
+    $('ros-slam-image-link').href = result.image_url;
+    $('ros-slam-yaml-link').hidden = false;
+    $('ros-slam-image-link').hidden = false;
+    $('ros-slam-message').textContent = '지도 저장 완료. YAML과 PGM 파일을 각각 다운로드하세요.';
+  } catch (error) {
+    $('ros-slam-message').textContent = error.message;
+  }
+  await pollNav2State();
+}
+
+async function startNav2Stack() {
+  $('nav2-start-btn').disabled = true;
+  showNav2Message('Starting ROS 2 Nav2 stack…');
+  try {
+    const result = await nav2Request('/nav2/stack/start', { method: 'POST' });
+    showNav2Message(result.message || 'Nav2 launch started; motors remain disarmed.');
+  } catch (error) {
+    showNav2Message(error.message, true);
+  } finally {
+    await pollNav2State();
+  }
+}
+
+async function armNav2() {
+  if (!window.confirm('모터를 무장할까요? 바퀴를 띄우거나 로봇 주변을 비우고, 비상정지 수단을 준비했는지 확인하세요.')) return;
+  $('nav2-arm-btn').disabled = true;
+  try {
+    await nav2Request('/nav2/claim', { method: 'POST', body: '{}' });
+    await nav2Request('/nav2/arm', { method: 'POST', body: '{}' });
+    showNav2Message('STM32 armed. Nav2 goals can now move the robot.');
+  } catch (error) {
+    showNav2Message(error.message, true);
+  }
+  await pollNav2State();
+}
+
+async function releaseNav2() {
+  try {
+    await nav2Request('/nav2/release', { method: 'POST', body: '{}' });
+    showNav2Message('Nav2 control released; STM32 disarmed.');
+  } catch (error) {
+    showNav2Message(error.message, true);
+  }
+  await pollNav2State();
+}
+
+async function stopNav2Stack() {
+  if (!window.confirm('Nav2를 종료하고 STM32 제어권을 해제할까요?')) return;
+  $('nav2-stop-btn').disabled = true;
+  try {
+    await nav2Request('/nav2/stack/stop', { method: 'POST', body: '{}' });
+    showNav2Message('Nav2 stopped; STM32 disarmed.');
+  } catch (error) {
+    showNav2Message(error.message, true);
+  }
+  await pollNav2State();
+}
+
+async function sendNav2Goal() {
+  if (!window.confirm('입력한 지도 좌표로 Nav2 목표를 전송합니다. 로봇 주변과 정지 수단을 확인했습니까?')) return;
+  try {
+    const xValue = $('nav2-goal-x').value.trim();
+    const yValue = $('nav2-goal-y').value.trim();
+    const yawValue = $('nav2-goal-yaw').value.trim();
+    if (!xValue || !yValue || !yawValue) throw new Error('목표 X, Y, 방향 값을 모두 입력하세요.');
+    const goal = {
+      x: Number(xValue),
+      y: Number(yValue),
+      yaw: Number(yawValue) * Math.PI / 180,
+    };
+    if (!Number.isFinite(goal.x) || !Number.isFinite(goal.y) || !Number.isFinite(goal.yaw)) {
+      throw new Error('목표 좌표와 방향은 유효한 숫자여야 합니다.');
+    }
+    if (Math.max(Math.abs(goal.x), Math.abs(goal.y)) > 20) {
+      throw new Error('목표 좌표는 지도 원점에서 20 m 이내여야 합니다.');
+    }
+    const result = await nav2Request('/nav2/goal', {
+      method: 'POST',
+      body: JSON.stringify(goal),
+    });
+    showNav2Message(`Goal sent: x=${result.goal.x.toFixed(2)} m, y=${result.goal.y.toFixed(2)} m.`);
+  } catch (error) {
+    showNav2Message(error.message, true);
+  }
+  await pollNav2State();
+}
+
+async function cancelNav2Goal() {
+  try {
+    await nav2Request('/nav2/cancel', { method: 'POST', body: '{}' });
+    showNav2Message('Nav2 goal cancellation requested.');
+  } catch (error) {
+    showNav2Message(error.message, true);
+  }
+}
+
 // --- Control mode: 'manual' | 'autonomous' -------------------------------
 let currentMode = 'manual';
 let modeRendered = null;
@@ -1042,8 +1387,8 @@ function applyControlMode(mode) {
   const note = $('nav-mode-note');
   if (note) {
     note.textContent = manual
-      ? 'manual mode — switch to Autonomous in Control mode to start auto-drive'
-      : 'autonomous mode — reactive lidar + camera obstacle avoidance active';
+      ? 'manual mode — start the Nav2 stack and select Nav2 autonomous mode to reserve ROS control'
+      : 'Nav2 control selected — motors stay disarmed until you confirm arming in the Nav2 panel';
   }
 
   // Gate the joystick + LLM command panels to manual mode only.
@@ -1080,6 +1425,7 @@ async function setControlMode(mode) {
   const ind = $('mode-indicator');
   if (ind) ind.textContent = `mode: ${label}…`;
   try {
+    if (mode === 'auto') await stopDpadMotion();
     const response = await fetch('/mode', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1088,9 +1434,10 @@ async function setControlMode(mode) {
     const payload = await response.json();
     if (!response.ok || !payload.success) throw new Error(payload.message || 'mode switch failed');
     applyControlMode(payload.data.mode);
-    pollNavState();
+    await Promise.all([pollNavState(), pollNav2State()]);
   } catch (error) {
     if (ind) { ind.textContent = `mode switch failed`; ind.style.color = 'var(--alert)'; }
+    showNav2Message(error.message, true);
   }
 }
 
@@ -1133,11 +1480,28 @@ $('stop-clear-button').addEventListener('click', clearEmergencyStop);
 $('refresh-button').addEventListener('click', refreshAll);
 
 document.querySelectorAll('.dpad-btn[data-vx]').forEach((button) => {
-  button.addEventListener('click', () => {
-    sendMotion(Number(button.dataset.vx), Number(button.dataset.vy), Number(button.dataset.wz));
+  button.addEventListener('pointerdown', (event) => {
+    event.preventDefault();
+    startDpadMotion(button);
+    if (button.setPointerCapture) button.setPointerCapture(event.pointerId);
+  });
+  button.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      startDpadMotion(button);
+    }
+  });
+  button.addEventListener('keyup', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') releaseDpadMotion();
   });
 });
-$('motion-stop-btn').addEventListener('click', () => sendMotion(0, 0, 0));
+document.addEventListener('pointerup', releaseDpadMotion);
+document.addEventListener('pointercancel', stopDpadMotion);
+window.addEventListener('blur', stopDpadMotion);
+$('motion-stop-btn').addEventListener('click', () => {
+  if (dpadActiveButton) stopDpadMotion();
+  else queueMotion(0, 0, 0);
+});
 $('motion-send-btn').addEventListener('click', () => {
   sendMotion(Number($('vx-input').value) || 0, Number($('vy-input').value) || 0, Number($('wz-input').value) || 0);
 });
@@ -1155,6 +1519,15 @@ $('camera-analyze-btn').addEventListener('click', analyzeCamera);
 $('lidar-refresh-btn').addEventListener('click', scanLidar);
 $('mode-manual-btn').addEventListener('click', () => setControlMode('manual'));
 $('mode-auto-btn').addEventListener('click', () => setControlMode('auto'));
+$('nav2-start-btn').addEventListener('click', startNav2Stack);
+$('nav2-arm-btn').addEventListener('click', armNav2);
+$('nav2-release-btn').addEventListener('click', releaseNav2);
+$('nav2-stop-btn').addEventListener('click', stopNav2Stack);
+$('nav2-goal-btn').addEventListener('click', sendNav2Goal);
+$('nav2-cancel-btn').addEventListener('click', cancelNav2Goal);
+$('ros-slam-start-btn').addEventListener('click', startRosSlam);
+$('ros-slam-stop-btn').addEventListener('click', stopRosSlam);
+$('ros-slam-save-btn').addEventListener('click', saveRosSlamMap);
 $('siren-btn').addEventListener('click', toggleSiren);
 
 applyControlMode('manual');
@@ -1167,6 +1540,9 @@ startSlamStream();
 pollNavState();
 startNavStream();
 setInterval(refreshAll, 5000);
+setInterval(pollNav2State, 1500);
+setInterval(pollRosSlamMap, 2000);
+pollRosSlamMap();
 // /camera/stream is a continuous MJPEG feed now, so the <img> stays live on
 // its own — no periodic re-fetch needed (that used to restart the feed
 // every 2s, which capped the effective preview rate and caused flicker).

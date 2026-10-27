@@ -86,10 +86,13 @@ CORS는 무관하지만 참고.
 `POST /mode` body `{ "mode": "auto" }` 또는 `{ "mode": "manual" }`
  → `data: { mode: ... }`
 
-- **autonomous**: 로봇이 스스로 주행. 수동 입력(조이스틱/LLM/음성)은 서버가
-  거부한다(`error: "autonomous_active"`).
+- **autonomous**: 실행 중인 ROS 2 Nav2 스택에 제어권을 예약한다. 스택이
+  실행 중이지 않으면 전환이 실패하며, 이 전환만으로 모터가 무장되거나
+  움직이지 않는다. 모터 무장과 목표 전송은 별도 Nav2 절차가 필요하다.
+  수동 입력(조이스틱/LLM/음성)은 서버가 거부한다(`error: "autonomous_active"`).
 - **manual**: 조이스틱·LLM·음성 명령 사용 가능.
-- 앱은 `/navigation/stream`(2.4)의 `enabled` 필드로 현재 모드를 실시간 추적하고,
+- `/mode` 응답을 모드의 기준으로 사용하고, `/navigation/stream`(2.4)은
+  레거시 반응형 내비게이터의 센서/결정 상태 표시용으로만 사용하라.
   autonomous일 때 수동 조작 UI를 비활성화(회색 처리)하라.
 
 #### 2.4 자율주행 상태 (SSE)
@@ -119,8 +122,9 @@ CORS는 무관하지만 참고.
 `GET /navigation/state` — 위와 동일한 JSON을 1회성으로. SSE 연결 실패 시 폴백으로
 0.7초 간격 폴링하라.
 
-`POST /navigation/start` / `POST /navigation/stop` — `/mode {auto|manual}`의 별칭.
-둘 중 하나만 써도 된다(앱은 `/mode`를 권장).
+`POST /navigation/start` / `POST /navigation/stop` — Nav2 autonomous/manual
+모드 전환 별칭. 시작은 실행 중인 Nav2 스택의 제어권만 예약하며 모터를 무장하지
+않는다. 앱은 오류 응답을 사용자에게 보여주고 `/mode` 사용을 권장한다.
 
 `POST /emergency-stop` — 즉시 정지 + 자율주행 해제 + `error` 모드 래치.
 `POST /emergency-stop/clear` — 래치 해제, `manual` 모드로 복귀(정지 상태).

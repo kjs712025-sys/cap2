@@ -15,6 +15,7 @@ class RobotConfig:
     debug: bool = False
     log_level: str = "INFO"
     log_file: str = "logs/robot.log"
+    simulation: bool = False
 
     uart_port: str = "/dev/serial0"
     uart_baudrate: int = 115200
@@ -125,6 +126,7 @@ class RobotConfig:
             debug=os.getenv("ROBOT_DEBUG", "0") == "1",
             log_level=os.getenv("ROBOT_LOG_LEVEL", defaults.log_level),
             log_file=os.getenv("ROBOT_LOG_FILE", defaults.log_file),
+            simulation=os.getenv("ROBOT_SIMULATION", "0") == "1",
             uart_port=os.getenv("ROBOT_UART_PORT", defaults.uart_port),
             uart_baudrate=int(os.getenv("ROBOT_UART_BAUDRATE", defaults.uart_baudrate)),
             uart_timeout=float(os.getenv("ROBOT_UART_TIMEOUT", defaults.uart_timeout)),

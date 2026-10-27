@@ -33,42 +33,53 @@ AI_Robot/
 2. Install dependencies: `pip install -r requirements.txt`
 3. Start the backend: `./start.sh`
 
-### Boot auto-start
+### Local demo without hardware
 
-Everything the robot needs comes up on power-on through systemd:
+Set `ROBOT_SIMULATION=1` in `.env` to run without a camera, LiDAR, STM32, or
+MQTT broker. The dashboard shows a virtual camera, a room scan with obstacles,
+simulated controller telemetry, and SLAM updates. Camera-based navigation
+fusion and fire monitoring are disabled because the virtual camera is only a
+visual preview. Motion and autonomous navigation commands only update the
+simulation; they are never sent to a physical device. The dashboard marks this
+mode as **SIMULATION · NO HARDWARE**.
+Open the dashboard at `http://127.0.0.1:8000/app/dashboard.html` (the voice
+command app at `/app/` also links to it).
 
-| Unit | Role | Enabled by |
-|---|---|---|
-| `ai-robot.service` | the backend (camera, lidar, navigation, fire monitor, SLAM, API); boots into autonomous driving | `systemctl enable` |
-| `mosquitto.service` | local MQTT broker on `0.0.0.0:1883` | distro default + `enable` |
-| `ssh.service` | remote access | distro default |
-| networkd + netplan | static Wi-Fi IP `192.168.137.97` from `/etc/netplan/50-cloud-init.yaml` | netplan generator, every boot |
+The dashboard also reports host CPU load, CPU temperature, available memory,
+and free disk space where Linux exposes them. Fire monitoring is shown as
+unavailable in simulation or when no camera is connected; a virtual preview is
+not treated as a fire-detection source.
 
-`ai-robot.service` is ordered `After=mosquitto.service network-online.target`
-and has `StartLimitIntervalSec=0` + `Restart=always`, so it retries forever
-rather than giving up. `start.sh` installs Python dependencies only when
-`requirements.txt` has changed since the last success (hash stamp at
-`.venv/.requirements.sha1`) and downgrades a failed `pip install` to a warning,
-so the robot still boots with no internet. Force a reinstall with
-`rm .venv/.requirements.sha1`; skip pip entirely with `ROBOT_SKIP_PIP=1`.
+Keep autonomous navigation on manual start by setting
+`ROBOT_NAV_AUTOSTART=0` and `ROBOT_AUTOSTART_AUTONOMOUS=0`. To start locally,
+set `ROBOT_HOST=127.0.0.1` and run `./start.sh`.
 
-**The service boots straight into autonomous driving** (`ROBOT_NAV_AUTOSTART=1`
-in the unit): the perception loop starts immediately and the navigator is
-enabled `ROBOT_NAV_AUTOSTART_DELAY` seconds later (default 8) once the LiDAR /
-camera have come up. It will not enable if the robot is already in an error
-state. Set `ROBOT_NAV_AUTOSTART=0` + `ROBOT_AUTOSTART_AUTONOMOUS=0` in the unit
-to boot in manual mode instead (the robot then stays stationary until it gets a
-joystick / LLM command).
+### Start dashboard automatically on boot
 
-Install / update the service:
+The `ai-robot.service` systemd unit starts the backend and dashboard after
+network startup and restarts the backend if it fails. It uses this checkout's
+Python virtual environment and `.env`, skips package installation during boot,
+and disables autonomous-motion autostart. With the current simulation
+configuration, no hardware is opened. In hardware mode peripherals may connect,
+but the service does not arm the STM32 or start either autonomous navigator.
+
+Install or update the service from this checkout:
 
 ```bash
-sudo cp ai-robot.service /etc/systemd/system/
+sudo install -m 0644 ai-robot.service /etc/systemd/system/ai-robot.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now ai-robot.service mosquitto.service
+sudo systemctl enable --now ai-robot.service
 ```
 
-Open `http://<robot-ip>:8000/app/` on a phone to use the voice command app.
+Check its status and logs:
+
+```bash
+systemctl status ai-robot.service
+journalctl -u ai-robot.service -f
+```
+
+Open `http://<robot-ip>:8000/` for the dashboard or `http://<robot-ip>:8000/app/`
+for the voice command app.
 Press and hold the microphone control, speak a command, then release it to
 send the recording to Gemini through `/command/voice`.
 
@@ -101,6 +112,12 @@ sudo systemctl status ai-robot
 ### Motion
 - POST `/motion/command` with JSON body `{ "vx": 0.2, "vy": 0.0, "wz": -0.1 }`
 
+On the dashboard, a short direction-button click drives for a bounded 450 ms;
+holding it streams joystick setpoints until release. Releasing sends zero
+velocity and disarms the STM32. The first nonzero manual command explicitly
+arms the board, and command failures are reported instead of being returned
+as success. Commands are clamped to the configured manual speed limits.
+
 `robot/stm32.py` speaks a checksummed ASCII line protocol to the STM32 motor
 board over `ROBOT_UART_PORT` (the ST-Link virtual COM port when connected by
 USB — `/dev/ttyACM0`, or a `/dev/serial/by-id/...-if02` path for stability):
@@ -117,10 +134,11 @@ USB — `/dev/ttyACM0`, or a `/dev/serial/by-id/...-if02` path for stability):
 | `B,<volts>` | battery voltage |
 | `S,<code>` / `E,<msg>` | board status / error |
 
-The autonomous navigator arms the board on `/navigation/start`, streams
-velocity setpoints + heartbeats each cycle, and disarms on `/navigation/stop`
-or an emergency stop. If the board is absent or drops mid-drive the link is
-marked down and retried on a 3 s backoff — the control loop never blocks.
+The legacy reactive navigator remains available internally for LiDAR
+perception, but dashboard/API autonomous mode is routed through Nav2. Keep
+`ROBOT_NAV_AUTOSTART=0`; enabling it starts the legacy navigator at boot and
+is not the supported Nav2 startup path. The STM32 link is retried on a 3 s
+backoff if the board is absent or drops.
 
 The matching STM32 firmware is [`firmware/omnibot_stm32/`](firmware/omnibot_stm32/)
 — an Arduino sketch for a NUCLEO-F411RE driving two AM-DC2-2D dual motor
@@ -129,6 +147,8 @@ telemetry; see that folder's README for wiring and the bench-calibration steps.
 - POST `/emergency-stop` — halt, drop autonomy, latch `error` mode
 - POST `/emergency-stop/clear` — release the latch after a safety check, back to
   stationary `manual` mode (autonomy is not auto-resumed)
+- ROS 2 control lease — `POST /nav2/claim`, `/nav2/arm`, `/nav2/cmd_vel`,
+  `/nav2/heartbeat`, and `/nav2/release` (the bridge uses these endpoints)
 
 ### Android app
 
@@ -149,28 +169,118 @@ implementation notes — to hand to a coding agent in Android Studio.
 The robot is always in exactly one control mode, and the dashboard's **Control
 mode** panel switches it:
 
-- `autonomous` — the reactive navigator drives; **manual inputs are refused**
-  with `{"error": "autonomous_active"}` so the two control paths never fight.
-  The bundled systemd service boots into this mode (`ROBOT_NAV_AUTOSTART=1`),
-  enabling the navigator `ROBOT_NAV_AUTOSTART_DELAY` seconds (default 8) after
-  startup so the LiDAR / camera can come up first.
+- `autonomous` — Nav2 owns the motion-control lease; **manual inputs are
+  refused** with `{"error": "autonomous_active"}`. Selecting this mode requires
+  a running Nav2 stack, reserves control, and keeps the motors disarmed.
 - `manual` — the joystick (`/motion/command`) and the LLM text/voice commands
-  (`/command/manual`, `/command/voice`) are live; the navigator's perception
-  loop still runs but issues no motion.
+  (`/command/manual`, `/command/voice`) are live.
+  The legacy reactive navigator's perception loop still runs but does not
+  issue motion in this supported control flow.
 
 Set `ROBOT_NAV_AUTOSTART=0` (and `ROBOT_AUTOSTART_AUTONOMOUS=0`) in the service
 to boot in `manual` instead.
 
+When the ROS 2 bridge claims control, the backend reports `autonomous` and
+blocks manual commands until Nav2 releases the control lease or its heartbeat
+times out.
+
 Endpoints:
 
 - GET `/mode` → `{ "mode": "manual" | "autonomous" | "error" }`
-- POST `/mode` `{ "mode": "manual" | "auto" }` — switch (aliases of
-  `/navigation/stop` / `/navigation/start`)
+- POST `/mode` `{ "mode": "manual" | "auto" }` — `auto` reserves Nav2 control
+  without arming; `manual` releases Nav2 and disarms
 
 ### Autonomous navigation
 - GET `/navigation/state` — latest snapshot: decision, per-sector clearances, downsampled scan, velocity
 - GET `/navigation/stream` — Server-Sent Events feed of the snapshot (~4 Hz) for the dashboard radar
-- POST `/navigation/start` / POST `/navigation/stop` — begin / end autonomous motion (same as `POST /mode`)
+- POST `/navigation/start` / POST `/navigation/stop` — compatibility aliases
+  for selecting Nav2 autonomous / manual mode; they do not arm the motors
+
+#### Nav2 using the existing STM32 and LiDAR
+
+The ROS 2 integration is in [`ros2_ws/src/omnibot_nav2/`](ros2_ws/src/omnibot_nav2/).
+It reuses the backend as the sole owner of both serial devices: the backend
+publishes YDLIDAR scans through its HTTP API, and ROS sends bounded `cmd_vel`
+commands back through the backend. Do not start a second ROS serial driver for
+the LiDAR or STM32. The old reactive navigator and Nav2 must not drive at the
+same time; the backend control lease rejects conflicting commands.
+
+The Nav2 bridge estimates `odom → base_link` by integrating commanded velocity.
+`slam_toolbox` uses LiDAR scan matching to publish map corrections. This is
+open-loop odometry, not wheel feedback: wheel slip, load, uneven floors, and
+motor variation cause drift, and scan matching can fail in feature-poor spaces.
+It is intended for supervised, low-speed evaluation, not safety-rated
+autonomy. The provisional outer footprint (340 × 250 mm) and centered LiDAR
+pose are in [`nav2/omnibot_geometry.yaml`](nav2/omnibot_geometry.yaml); verify
+them physically before navigation.
+The speed limits below constrain command values, not measured wheel speed:
+the existing STM32 firmware has no velocity feedback, so actual speed must be
+measured and calibrated before any floor test.
+
+Build the ROS package on the robot after the backend service is active. The
+full CLI launch below is an alternative to the dashboard process controls; do
+not run it at the same time as the dashboard-managed ROS processes:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+cd ros2_ws
+# Install python3-colcon-common-extensions with apt if colcon is not available.
+colcon build --symlink-install --packages-select omnibot_nav2
+source install/setup.bash
+ros2 launch omnibot_nav2 omnibot_nav2.launch.py
+```
+
+The full CLI launch starts the scan/odometry bridge, online `slam_toolbox`, and Nav2.
+It does **not** claim motor control or arm the STM32. First verify `/scan`,
+`/odom`, and TF (`map → odom → base_link → lidar_link`) while the robot is
+stationary. The bridge requires a fresh complete physical scan before it will
+arm, and releases/disarms if scans become stale or the backend heartbeat is
+lost. With wheels raised and the chassis secured, explicitly claim and arm the
+bridge only for supervised checks:
+
+```bash
+ros2 service call /omnibot/claim_control std_srvs/srv/Trigger "{}"
+ros2 service call /omnibot/arm std_srvs/srv/Trigger "{}"
+```
+
+Send a Nav2 goal only after sensor orientation, scan matching, and the
+open-loop odometry have been checked. The bridge and backend cap linear
+velocity setpoints to 0.10 m/s and angular setpoints to 0.25 rad/s; these are
+not measured physical-speed limits. Release control to stop and disarm:
+
+```bash
+ros2 service call /omnibot/release_control std_srvs/srv/Trigger "{}"
+```
+
+The dashboard's **자율주행 (Nav2)** mode button reserves control for Nav2 only
+after the ROS 2 Nav2 stack is running. It never arms the motors. The explicit
+**모터 무장** action performs the separate sensor/safety checks and asks for
+confirmation; only then can a goal move the robot. **수동조작** releases the
+lease and disarms.
+
+The dashboard starts the ROS backend bridge and Nav2 independently from the
+**Autonomous navigation → ROS 2 Jazzy · Nav2** panel. The separate
+**ROS 2 SLAM Toolbox** panel starts/stops mapping without stopping Nav2. Its
+canvas displays the live ROS `/map` occupancy grid; **지도 저장** invokes
+`nav2_map_server map_saver_cli` and then exposes YAML and PGM downloads. The
+files are written under `maps/nav2_map.*` in the project directory.
+
+Starting either ROS component does not move the robot. On real hardware,
+explicit arming is disabled until SLAM is running and a fresh ROS map is being
+received, in addition to the physical LiDAR and STM32 checks. Goal X/Y values
+are in the current map frame, and the direction is in degrees. **목표 취소**
+cancels the active goal; **제어 해제·정지** disarms and releases control.
+**Nav2 스택 종료** leaves an independently running SLAM process intact.
+SLAM cannot be stopped while Nav2 holds the motor-control lease. These
+dashboard actions do not replace the stationary checks or supervised hardware
+validation above.
+
+The backend also disarms if the bridge heartbeat is lost. The dashboard's
+emergency-stop endpoint remains available. If backend API authentication is
+configured, provide the same token to the bridge through `ROBOT_API_TOKEN`.
+
+The launch files and ROS parameters are integration scaffolding; hardware
+motion is not auto-started by systemd and has not been validated on the robot.
 
 A reactive obstacle-avoidance loop (`robot/navigation.py`) runs continuously
 for situational awareness: each cycle it reads a LiDAR scan, splits it into

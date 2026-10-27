@@ -68,6 +68,11 @@ class Camera:
 
     def open(self) -> None:
         """Open the configured camera source."""
+        if self.config.simulation:
+            self._is_running = True
+            logger.info("Using simulated camera; no physical device will be opened")
+            return
+
         if self.config.camera_source == "pi":
             if self._picam2 is not None:
                 return
@@ -94,6 +99,8 @@ class Camera:
 
     def is_ready(self) -> bool:
         """Return whether the camera abstraction is configured for use."""
+        if self.config.simulation:
+            return True
         if self.config.camera_source == "pi":
             if self._picam2 is None:
                 self.open()
@@ -122,6 +129,29 @@ class Camera:
 
     def read_frame(self) -> Optional[CameraFrame]:
         """Read a single frame from the camera."""
+        if self.config.simulation:
+            image = np.full((480, 640, 3), (18, 30, 32), dtype=np.uint8)
+            horizon = 185
+            cv2.fillPoly(
+                image,
+                [np.array([[0, horizon], [640, horizon], [640, 480], [0, 480]], dtype=np.int32)],
+                (34, 48, 48),
+            )
+            cv2.line(image, (0, horizon), (640, horizon), (95, 227, 212), 1)
+            for x in range(-400, 1100, 100):
+                cv2.line(image, (320, horizon), (x, 480), (55, 85, 82), 1)
+            for y in (235, 285, 360, 455):
+                cv2.line(image, (0, y), (640, y), (55, 85, 82), 1)
+            cv2.putText(
+                image, "SIMULATED CAMERA", (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (205, 251, 110), 2,
+            )
+            cv2.putText(
+                image, "NO PHYSICAL CAMERA CONNECTED", (20, 460),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (174, 191, 186), 1,
+            )
+            return CameraFrame(image=image, timestamp=cv2.getTickCount())
+
         if self.config.camera_source == "pi":
             try:
                 if self._picam2 is None:

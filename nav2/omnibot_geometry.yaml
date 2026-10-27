@@ -1,0 +1,31 @@
+# Provisional geometry estimates from the robot photos and nominal chassis size.
+# Reference values; matching values are copied into the ROS 2 Nav2 parameters.
+# This file is not loaded programmatically.
+estimate_source: "photos and nominal 0.300 x 0.215 m chassis dimensions"
+base_frame: base_link
+
+chassis:
+  length_m: 0.300
+  width_m: 0.215
+
+# Conservative outer envelope including the wheels extending beyond the shell.
+# Polygon order is counter-clockwise in the base_link XY plane.
+nav2_footprint_m:
+  - [-0.170, -0.125]
+  - [0.170, -0.125]
+  - [0.170, 0.125]
+  - [-0.170, 0.125]
+
+# The LiDAR appears close to the chassis center in the top view. Height is an
+# initial visual estimate relative to a base_link at the wheel axle plane.
+lidar_pose_in_base_link_m:
+  x: 0.0
+  y: 0.0
+  z: 0.160
+  yaw_rad: 0.0
+
+# Nav2 bridge integrates the accepted velocity commands; this is open-loop
+# odometry, not measured wheel motion, and will drift under slip/load changes.
+odometry_source: command_velocity_open_loop
+odometry_feedback: false
+autonomous_motion_enabled: false

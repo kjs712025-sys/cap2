@@ -45,7 +45,9 @@ def test_snapshot_payload_shape() -> None:
 
 
 def test_slam_status_and_map_endpoints() -> None:
-    app = create_app(RobotConfig(debug=True, llm_enabled=False, enable_websocket=False))
+    app = create_app(
+        RobotConfig(debug=True, simulation=True, llm_enabled=False, enable_websocket=False)
+    )
     client = TestClient(app)
 
     response = client.get("/slam/status")

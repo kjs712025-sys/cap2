@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 logs/
 captures/
+maps/
 *.log
 .env
 .DS_Store

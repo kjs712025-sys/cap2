@@ -35,7 +35,10 @@ blinks with M3's direction bit.
 ## Calibrate (wheels off the ground)
 
 Serial Monitor @ 115200, line ending **Newline** — checksums are optional when
-typing by hand:
+typing by hand. The firmware also has a `T` self-test that runs forward,
+reverse, left, right, and counter-clockwise motion steps for about 3 seconds
+each. Use it only with the wheels raised and the chassis secured; it keeps
+running independently of the serial watchdog. Send `A,0` to interrupt it.
 
 | send | expect | if wrong |
 |---|---|---|
@@ -59,9 +62,12 @@ typing by hand:
 
 ```
 frame = "<payload>*<HH>\n"     HH = (sum of payload bytes) & 0xFF, upper-hex
-Pi  -> STM32 :  A,1 | A,0 | V,<vx>,<vy>,<wz> | H
+Pi  -> STM32 :  A,1 | A,0 | V,<vx>,<vy>,<wz> | H | T
 STM32 -> Pi  :  S,<state> | B,<volts> | E,<msg> | O,<x>,<y>,<yaw>
 ```
+
+`T` is a bench-only firmware self-test; the Python backend does not send it.
+The backend sends and parses the other listed frames.
 
 If no `V`/`H` arrives for 500 ms the wheels coast to a stop (the board stays
 armed and resumes when frames return); the next `S,` heartbeat reports

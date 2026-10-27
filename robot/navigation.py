@@ -63,7 +63,11 @@ class AutonomousNavigator:
         self.interval = max(0.1, getattr(config, "nav_interval", 0.25))
         self.cruise_speed = min(getattr(config, "nav_cruise_speed", 0.15), config.max_linear_speed)
         self.turn_speed = min(getattr(config, "nav_turn_speed", 0.5), config.max_angular_speed)
-        self.use_camera = bool(camera) and getattr(config, "nav_use_camera", True)
+        self.use_camera = (
+            bool(camera)
+            and getattr(config, "nav_use_camera", True)
+            and not getattr(config, "simulation", False)
+        )
         self.camera_estimator = FloorObstacleEstimator(
             horizontal_fov_deg=getattr(config, "nav_camera_fov_deg", 62.0)
         )

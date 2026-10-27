@@ -89,13 +89,21 @@ def test_navigator_holds_still_under_emergency_stop() -> None:
 
 
 def test_navigation_endpoints_toggle_state() -> None:
-    app = create_app(RobotConfig(debug=True, llm_enabled=False, enable_websocket=False))
+    app = create_app(
+        RobotConfig(debug=True, simulation=True, llm_enabled=False, enable_websocket=False)
+    )
+    app.state.nav2_process.state = lambda: {"running": True}
     client = TestClient(app)
 
     assert client.get("/navigation/state").json()["data"]["enabled"] is False
-    assert client.post("/navigation/start").json()["data"]["enabled"] is True
+    started = client.post("/navigation/start").json()
+    assert started["data"] == {"claimed": True, "armed": False}
+    assert app.state.nav2_control_active is True
     assert app.state.status.mode.value == "autonomous"
-    assert client.post("/navigation/stop").json()["data"]["enabled"] is False
+    assert app.state.stm32.status.armed is False
+    stopped = client.post("/navigation/stop").json()
+    assert stopped["data"] == {"claimed": False, "armed": False}
+    assert app.state.nav2_control_active is False
 
 
 def test_api_info_and_token_guard() -> None:
@@ -135,7 +143,10 @@ def test_nav_autostart_enables_navigator_after_delay() -> None:
 
 
 def test_mode_switch_gates_manual_control() -> None:
-    app = create_app(RobotConfig(debug=True, llm_enabled=False, enable_websocket=False))
+    app = create_app(
+        RobotConfig(debug=True, simulation=True, llm_enabled=False, enable_websocket=False)
+    )
+    app.state.nav2_process.state = lambda: {"running": True}
     client = TestClient(app)
 
     # boots in manual mode — joystick + LLM commands allowed
@@ -143,8 +154,11 @@ def test_mode_switch_gates_manual_control() -> None:
     assert client.post("/motion/command", json={"vx": 0.1, "vy": 0.0, "wz": 0.0}).json()["success"] is True
     assert client.post("/command/manual", json={"text": "stop"}).json()["success"] is True
 
-    # switch to autonomous — manual inputs now refused
+    # switch to Nav2 autonomous control; it reserves control but does not arm
     assert client.post("/mode", json={"mode": "auto"}).json()["data"]["mode"] == "autonomous"
+    assert app.state.nav2_control_active is True
+    assert app.state.stm32.status.armed is False
+    assert app.state.navigator.enabled is False
     motion = client.post("/motion/command", json={"vx": 0.1, "vy": 0.0, "wz": 0.0}).json()
     assert motion["success"] is False and motion["error"] == "autonomous_active"
     text = client.post("/command/manual", json={"text": "go"}).json()
@@ -160,15 +174,19 @@ def test_mode_switch_gates_manual_control() -> None:
 def test_emergency_stop_and_clear_round_trip() -> None:
     from robot.status import RobotMode
 
-    app = create_app(RobotConfig(debug=True, llm_enabled=False, enable_websocket=False))
+    app = create_app(
+        RobotConfig(debug=True, simulation=True, llm_enabled=False, enable_websocket=False)
+    )
     client = TestClient(app)
 
-    client.post("/mode", json={"mode": "auto"})           # start autonomous driving
+    app.state.nav2_process.state = lambda: {"running": True}
+    client.post("/mode", json={"mode": "auto"})
     assert client.get("/mode").json()["data"]["mode"] == "autonomous"
 
     assert client.post("/emergency-stop").json()["success"] is True
     assert app.state.status.mode is RobotMode.ERROR
     assert app.state.navigator.enabled is False           # estop also drops autonomy
+    assert app.state.nav2_control_active is False
     # manual control is refused while latched
     assert client.post("/motion/command", json={"vx": 0.1, "vy": 0, "wz": 0}).json()["error"] == "emergency_latched"
 

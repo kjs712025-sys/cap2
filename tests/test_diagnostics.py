@@ -29,6 +29,18 @@ def test_diagnostics_endpoint() -> None:
     assert payload["data"]["components"]["camera"]["ready"] in {True, False}
     assert "connected" in payload["data"]["components"]["camera"]
     assert "last_error" in payload["data"]["components"]["lidar"]
+    assert set(payload["data"]["system"]) == {
+        "cpu_load_1m",
+        "cpu_temperature_c",
+        "memory_available_mb",
+        "disk_free_gb",
+    }
+    assert payload["data"]["components"]["fire_monitor"]["state"] in {
+        "monitoring",
+        "no_camera",
+        "disabled",
+    }
+    assert client.get("/telemetry").json()["data"]["fire"] == "unavailable"
 
     status_payload = app.state.status.to_payload()
     assert json.dumps(status_payload)

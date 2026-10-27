@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0a0e10">
   <title>OmniBot Dashboard</title>
-  <link rel="stylesheet" href="/app/dashboard.css?v=15">
+  <link rel="stylesheet" href="/app/dashboard.css?v=20">
 </head>
 <body>
   <main class="shell">
@@ -15,6 +15,7 @@
         <h1 id="robot-name">Robot dashboard</h1>
       </div>
       <div class="topbar-right">
+        <span id="simulation-badge" class="simulation-badge" hidden>SIMULATION · NO HARDWARE</span>
         <button id="siren-btn" class="icon-button siren-btn" type="button">🔇 Siren off</button>
         <span id="uptime" class="uptime">uptime --</span>
         <span id="connection" class="connection offline">Offline</span>
@@ -44,9 +45,9 @@
         <div class="panel-heading"><h2>Control mode</h2><span id="mode-indicator" class="uptime">mode --</span></div>
         <div class="mode-toggle">
           <button id="mode-manual-btn" class="mode-btn" type="button">🕹️ 수동조작<span>Manual</span></button>
-          <button id="mode-auto-btn" class="mode-btn" type="button">🤖 자율주행<span>Autonomous</span></button>
+          <button id="mode-auto-btn" class="mode-btn" type="button">🤖 자율주행 (Nav2)<span>ROS 2 Nav2</span></button>
         </div>
-        <p class="hint" id="mode-hint">수동조작 모드에서만 조이스틱·LLM 명령을 사용할 수 있습니다. 자율주행 모드에서는 라이다·카메라 기반 회피 주행이 동작합니다.</p>
+        <p class="hint" id="mode-hint">Nav2 스택을 시작한 뒤 선택하세요. 모드 전환은 제어권만 예약하며 모터를 무장하지 않습니다. 별도 무장 확인 후 목표를 전송하세요.</p>
       </section>
 
       <section class="panel wide">
@@ -73,8 +74,43 @@
 
       <section class="panel wide">
         <div class="panel-heading">
+          <h2>System health</h2>
+          <span id="fire-monitor-state" class="uptime">fire monitor --</span>
+        </div>
+        <div class="grid grid-4">
+          <div class="stat"><span>CPU load · 1m</span><strong id="system-cpu-load">--</strong></div>
+          <div class="stat"><span>CPU temperature</span><strong id="system-cpu-temp">--</strong></div>
+          <div class="stat"><span>Memory available</span><strong id="system-memory">--</strong></div>
+          <div class="stat"><span>Disk free</span><strong id="system-disk">--</strong></div>
+        </div>
+        <p id="fire-monitor-detail" class="hw-detail system-note"></p>
+      </section>
+
+      <section class="panel wide">
+        <div class="panel-heading">
           <h2>Autonomous navigation</h2>
           <span id="nav-stream-state" class="uptime">stream --</span>
+        </div>
+        <div class="nav2-control-panel">
+          <div class="nav2-control-head">
+            <strong>ROS 2 Jazzy · Nav2</strong>
+            <span id="nav2-stack-state" class="badge offline">not running</span>
+          </div>
+          <p class="hw-detail">엔코더 미사용 · 명령 적분 오도메트리(개루프). 스택 시작만으로는 모터가 무장되지 않습니다. 바닥 주행 전 안전 검증이 필요합니다.</p>
+          <div class="nav2-buttons">
+            <button id="nav2-start-btn" class="icon-button" type="button">Nav2 스택 시작</button>
+            <button id="nav2-arm-btn" class="icon-button" type="button" disabled>모터 무장</button>
+            <button id="nav2-release-btn" class="icon-button" type="button" disabled>제어 해제·정지</button>
+            <button id="nav2-stop-btn" class="icon-button" type="button">Nav2 스택 종료</button>
+          </div>
+          <div class="nav2-goal-row">
+            <label>목표 X (m)<input id="nav2-goal-x" type="number" step="0.1" value="0.5"></label>
+            <label>목표 Y (m)<input id="nav2-goal-y" type="number" step="0.1" value="0"></label>
+            <label>방향 (deg)<input id="nav2-goal-yaw" type="number" step="5" value="0"></label>
+            <button id="nav2-goal-btn" class="icon-button" type="button" disabled>목표 전송</button>
+            <button id="nav2-cancel-btn" class="icon-button" type="button" disabled>목표 취소</button>
+          </div>
+          <p id="nav2-message" class="hw-detail" role="status">상태 확인 중…</p>
         </div>
         <div class="nav-grid">
           <div class="nav-radar-wrap">
@@ -110,7 +146,7 @@
 
       <section class="panel">
         <div class="panel-heading">
-          <h2>SLAM map</h2>
+          <h2>Backend SLAM estimate</h2>
           <span id="slam-stream-state" class="uptime">stream --</span>
         </div>
         <div class="nav-radar-wrap">
@@ -124,8 +160,29 @@
         </div>
       </section>
 
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>ROS 2 SLAM Toolbox</h2>
+          <span id="ros-slam-state" class="badge offline">stopped</span>
+        </div>
+        <p class="hw-detail">Nav2와 분리해 SLAM mapping을 시작·종료합니다. 실제 ROS OccupancyGrid 지도이며 backend 추정 지도와 별도입니다.</p>
+        <div class="nav2-buttons ros-slam-buttons">
+          <button id="ros-slam-start-btn" class="icon-button" type="button">SLAM 시작</button>
+          <button id="ros-slam-stop-btn" class="icon-button" type="button" disabled>SLAM 종료</button>
+          <button id="ros-slam-save-btn" class="icon-button" type="button" disabled>지도 저장</button>
+          <a id="ros-slam-yaml-link" class="icon-button map-download" hidden download>YAML 다운로드</a>
+          <a id="ros-slam-image-link" class="icon-button map-download" hidden download>PGM 다운로드</a>
+        </div>
+        <p id="ros-slam-message" class="hw-detail" role="status">ROS SLAM map 대기 중</p>
+        <div class="nav-radar-wrap ros-slam-map-wrap">
+          <canvas id="ros-slam-canvas" width="420" height="420" class="nav-radar"></canvas>
+          <p id="ros-slam-map-caption" class="nav-radar-cap">ROS /map occupancy grid</p>
+        </div>
+      </section>
+
       <section class="panel" id="motion-panel">
         <div class="panel-heading"><h2>Motion control</h2><span class="badge manual-only-badge">manual only</span></div>
+        <p class="hw-detail">방향 버튼 클릭 시 짧게 이동하고, 길게 누르면 계속 이동합니다. 버튼을 놓으면 정지·모터 해제됩니다. 수동 명령 시 STM32가 자동 무장됩니다.</p>
         <div class="motion-grid">
           <div class="dpad">
             <button class="dpad-btn dpad-ccw" data-vx="0" data-vy="0" data-wz="0.6" type="button" aria-label="Rotate left">&#8634;</button>
@@ -195,6 +252,6 @@
       </section>
     </div>
   </main>
-  <script src="/app/dashboard.js?v=15"></script>
+  <script src="/app/dashboard.js?v=24"></script>
 </body>
 </html>

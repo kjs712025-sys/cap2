@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ class LidarStatus:
 
     connected: bool = False
     last_scan: Optional[list[ScanPoint]] = None
+    last_scan_hardware: bool = False
     last_error: Optional[str] = None
 
 
@@ -75,11 +77,18 @@ class LidarSensor:
 
         if self._resync_to_header(CONNECT_TIMEOUT_S):
             self.status.connected = True
+            self.status.last_scan_hardware = False
             self.status.last_error = None
             logger.info("LiDAR connected on %s", self.config.lidar_port)
         else:
             self.status.connected = False
             self.status.last_error = "No valid YDLiDAR packet received"
+            if self.serial is not None:
+                try:
+                    self.serial.close()
+                except (serial.SerialException, OSError):
+                    logger.warning("LiDAR close failed after packet timeout")
+            self.serial = None
             logger.warning(
                 "LiDAR port %s opened but no valid packets seen", self.config.lidar_port
             )
@@ -105,6 +114,12 @@ class LidarSensor:
 
     def initialize(self) -> bool:
         """Attempt to initialize the LiDAR sensor and return whether it is ready."""
+        if self.config.simulation:
+            self.status.connected = True
+            self.status.last_error = None
+            self.status.last_scan = self._generate_virtual_scan()
+            logger.info("Using simulated LiDAR; no physical device will be opened")
+            return True
         self.connect()
         return self.is_ready()
 
@@ -118,6 +133,7 @@ class LidarSensor:
                 logger.warning("LiDAR close failed")
             self.serial = None
         self.status.connected = False
+        self.status.last_scan_hardware = False
         logger.info("LiDAR disconnected")
 
     def parse_scan_text(self, text: str) -> list[ScanPoint]:
@@ -150,6 +166,27 @@ class LidarSensor:
             ScanPoint(angle_deg=30.0, distance_m=2.5),
         ]
 
+    @staticmethod
+    def _generate_virtual_scan() -> list[ScanPoint]:
+        """Return a full scan of a small virtual room with two obstacles."""
+        points: list[ScanPoint] = []
+        obstacles = ((1.35, 0.0, 0.35), (2.0, 1.1, 0.4))
+        for angle_deg in range(0, 360, 5):
+            angle = math.radians(angle_deg)
+            dx, dy = math.cos(angle), math.sin(angle)
+            distance = min(
+                3.0 / abs(dx) if abs(dx) > 1e-6 else float("inf"),
+                3.0 / abs(dy) if abs(dy) > 1e-6 else float("inf"),
+            )
+            for center_x, center_y, radius in obstacles:
+                projection = center_x * dx + center_y * dy
+                perpendicular_sq = center_x**2 + center_y**2 - projection**2
+                discriminant = radius**2 - perpendicular_sq
+                if projection > 0 and discriminant >= 0:
+                    distance = min(distance, projection - math.sqrt(discriminant))
+            points.append(ScanPoint(angle_deg=float(angle_deg), distance_m=round(distance, 3)))
+        return points
+
     def _read_packet(self) -> Optional[tuple[float, float, list[int]]]:
         """Read and decode one YDLiDAR data packet.
 
@@ -180,10 +217,17 @@ class LidarSensor:
 
     def read_scan(self) -> list[ScanPoint]:
         """Return one full rotation of points from the sensor, or a simulated fallback."""
+        if self.config.simulation:
+            scan = self._generate_virtual_scan()
+            self._scan_buffer = scan
+            self.status.last_scan = scan
+            self.status.last_scan_hardware = False
+            return scan
         if not self.status.connected or not self.serial:
             scan = self._generate_simulated_scan()
             self._scan_buffer = scan
             self.status.last_scan = scan
+            self.status.last_scan_hardware = False
             return scan
 
         with self._read_lock:
@@ -192,6 +236,7 @@ class LidarSensor:
     def _read_scan_locked(self) -> list[ScanPoint]:
         points: list[ScanPoint] = []
         previous_end_angle: Optional[float] = None
+        completed_rotation = False
         deadline = time.monotonic() + SCAN_TIMEOUT_S
 
         try:
@@ -221,13 +266,23 @@ class LidarSensor:
 
                 # A full rotation completed once the running angle wraps back down.
                 if previous_end_angle is not None and end_angle < previous_end_angle and points:
+                    completed_rotation = True
                     break
                 previous_end_angle = end_angle
         except (serial.SerialException, OSError) as exc:
+            self.status.connected = False
+            self.status.last_scan_hardware = False
             self.status.last_error = str(exc)
+            if self.serial is not None:
+                try:
+                    self.serial.close()
+                except (serial.SerialException, OSError):
+                    logger.warning("LiDAR close failed after read error")
+                self.serial = None
             logger.warning("LiDAR read failed: %s", exc)
 
         scan = points or self._generate_simulated_scan()
         self._scan_buffer = scan
         self.status.last_scan = scan
+        self.status.last_scan_hardware = completed_rotation and bool(points)
         return scan

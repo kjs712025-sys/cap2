@@ -74,7 +74,10 @@ def test_voice_endpoint_available_in_manual_refused_in_autonomous() -> None:
     from fastapi.testclient import TestClient
     from network.server import create_app
 
-    app = create_app(RobotConfig(debug=True, llm_enabled=False, enable_websocket=False))
+    app = create_app(
+        RobotConfig(debug=True, simulation=True, llm_enabled=False, enable_websocket=False)
+    )
+    app.state.nav2_process.state = lambda: {"running": True}
     client = TestClient(app)
 
     # no key -> transcription returns "" -> assistant reports "none", but the

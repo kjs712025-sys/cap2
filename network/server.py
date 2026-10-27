@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from ai.assistant import RobotAssistant
@@ -20,6 +21,7 @@ from config import RobotConfig
 from lidar.lidar import LidarSensor
 from network.api import router as api_router
 from network.mqtt import MqttPublisher
+from network.nav2_process import Nav2Process
 from network.websocket import RobotSocketManager
 from robot.manual import ManualController
 from robot.navigation import AutonomousNavigator
@@ -31,6 +33,7 @@ from utils.alerts import AlertManager
 from utils.event_log import EventLogger
 from utils.logger import configure_logging
 from utils.logger import get_logger
+from utils.system_monitor import SystemMonitor
 
 logger = get_logger("network.server")
 
@@ -64,6 +67,10 @@ def create_app(config: RobotConfig) -> FastAPI:
 
     app.mount("/app", StaticFiles(directory="app", html=True), name="robot_app")
 
+    @app.get("/", include_in_schema=False)
+    async def dashboard_home() -> RedirectResponse:
+        return RedirectResponse(url="/app/dashboard.html")
+
     stm32 = STM32Controller(config)
     camera = Camera(config)
     lidar = LidarSensor(config)
@@ -80,7 +87,7 @@ def create_app(config: RobotConfig) -> FastAPI:
         host=config.mqtt_host,
         port=config.mqtt_port,
         base_topic=config.mqtt_base_topic,
-        enabled=config.mqtt_enabled,
+        enabled=config.mqtt_enabled and not config.simulation,
     )
     app.state.mqtt = mqtt
     socket_manager = RobotSocketManager()
@@ -103,6 +110,7 @@ def create_app(config: RobotConfig) -> FastAPI:
         app.state.status.mission = "autonomous_ready"
         app.state.status.ai_state = "autonomous_standby"
     app.state.started_at = time.time()
+    app.state.system_monitor = SystemMonitor()
     app.state.event_logger = event_logger
     app.state.alert_manager = alert_manager
     app.state.slam = slam
@@ -138,6 +146,14 @@ def create_app(config: RobotConfig) -> FastAPI:
     app.state.navigator = navigator
     app.state.manual_task = None
     app.state.navigator_task = None
+    app.state.nav2_control_active = False
+    app.state.nav2_last_command_at = 0.0
+    app.state.nav2_goal_sequence = 0
+    app.state.nav2_cancel_sequence = 0
+    app.state.nav2_goal = None
+    app.state.nav2_process = Nav2Process(Path(__file__).resolve().parents[1])
+    app.state.ros_slam_map = None
+    app.state.ros_slam_map_received_at = 0.0
     stm32.initialize()
     camera.initialize()
     lidar.initialize()
@@ -155,17 +171,27 @@ def create_app(config: RobotConfig) -> FastAPI:
             if alerts:
                 app.state.event_logger.log("alert", {"alerts": alerts})
             hardware_payload = {
+                "simulation": config.simulation,
+                "system": app.state.system_monitor.read(),
+                "fire_monitor": {
+                    "enabled": config.fire_monitor_enabled and not config.simulation,
+                    "state": "simulation" if config.simulation else (
+                        "monitoring" if config.fire_monitor_enabled and app.state.camera.is_ready()
+                        else "disabled" if not config.fire_monitor_enabled
+                        else "no_camera"
+                    ),
+                },
                 "stm32": {
                     "connected": getattr(app.state.stm32, "status", None).connected if getattr(app.state, "stm32", None) else False,
                     "last_error": getattr(getattr(app.state.stm32, "status", None), "last_error", None),
                 },
                 "camera": {
                     "ready": app.state.camera.is_ready() if getattr(app.state, "camera", None) else False,
-                    "source": getattr(config, "camera_source", "unknown"),
+                    "source": "simulation" if config.simulation else getattr(config, "camera_source", "unknown"),
                 },
                 "lidar": {
                     "ready": app.state.lidar.is_ready() if getattr(app.state, "lidar", None) else False,
-                    "port": getattr(config, "lidar_port", "unknown"),
+                    "port": "virtual" if config.simulation else getattr(config, "lidar_port", "unknown"),
                 },
             }
             status_payload = {
@@ -184,11 +210,28 @@ def create_app(config: RobotConfig) -> FastAPI:
             )
             mqtt.publish("fire", fire_monitor.snapshot(), retain=True)
 
+    async def _nav2_command_watchdog() -> None:
+        while True:
+            await asyncio.sleep(0.1)
+            if (
+                app.state.nav2_control_active
+                and time.monotonic() - app.state.nav2_last_command_at > 0.5
+            ):
+                logger.error("Nav2 command stream timed out; stopping and disarming STM32")
+                app.state.nav2_control_active = False
+                stm32.disarm()
+                app.state.status.update_speed(0.0, 0.0, 0.0)
+                if app.state.status.mode is RobotMode.AUTONOMOUS:
+                    app.state.status.set_mode(RobotMode.MANUAL)
+                    app.state.status.mission = "ready"
+                    app.state.status.ai_state = "standby"
+
     @app.on_event("startup")
     async def start_status_stream() -> None:
         mqtt.start()
         asyncio.create_task(_emit_status_loop())
-        if config.fire_monitor_enabled:
+        app.state.nav2_watchdog_task = asyncio.create_task(_nav2_command_watchdog())
+        if config.fire_monitor_enabled and not config.simulation:
             # Local YOLOv8 detection (camera/vision.py) — no cloud API key needed.
             app.state.fire_monitor_task = asyncio.create_task(fire_monitor.run())
             logger.info("Fire monitor enabled on camera index %s", config.camera_index)
@@ -216,16 +259,24 @@ def create_app(config: RobotConfig) -> FastAPI:
 
     @app.on_event("shutdown")
     async def stop_background_tasks() -> None:
-        for name in ("fire_monitor_task", "navigator_task", "manual_task", "nav_autostart_task"):
+        for name in (
+            "fire_monitor_task",
+            "navigator_task",
+            "manual_task",
+            "nav_autostart_task",
+            "nav2_watchdog_task",
+        ):
             task = getattr(app.state, name, None)
             if task is not None:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
         navigator.disable()
+        nav2_process = app.state.nav2_process
+        nav2_process.stop_all()
         mqtt.stop()
 
     @app.websocket("/ws")
-    async def websocket_endpoint(websocket) -> None:
+    async def websocket_endpoint(websocket: WebSocket) -> None:
         await socket_manager.connect(websocket)
         try:
             await socket_manager.broadcast_status(
@@ -234,17 +285,27 @@ def create_app(config: RobotConfig) -> FastAPI:
                     "robot_name": config.robot_name,
                     "status": app.state.status.to_payload(),
                     "hardware": {
+                        "simulation": config.simulation,
+                        "system": app.state.system_monitor.read(),
+                        "fire_monitor": {
+                            "enabled": config.fire_monitor_enabled and not config.simulation,
+                            "state": "simulation" if config.simulation else (
+                                "monitoring" if config.fire_monitor_enabled and app.state.camera.is_ready()
+                                else "disabled" if not config.fire_monitor_enabled
+                                else "no_camera"
+                            ),
+                        },
                         "stm32": {
                             "connected": getattr(app.state.stm32, "status", None).connected if getattr(app.state, "stm32", None) else False,
                             "last_error": getattr(getattr(app.state.stm32, "status", None), "last_error", None),
                         },
                         "camera": {
                             "ready": app.state.camera.is_ready() if getattr(app.state, "camera", None) else False,
-                            "source": getattr(config, "camera_source", "unknown"),
+                            "source": "simulation" if config.simulation else getattr(config, "camera_source", "unknown"),
                         },
                         "lidar": {
                             "ready": app.state.lidar.is_ready() if getattr(app.state, "lidar", None) else False,
-                            "port": getattr(config, "lidar_port", "unknown"),
+                            "port": "virtual" if config.simulation else getattr(config, "lidar_port", "unknown"),
                         },
                     },
                 }
