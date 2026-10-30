@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 from config import RobotConfig
+from camera.camera import Camera
 from camera.stream import CameraStream
 from lidar.lidar import LidarSensor
 
@@ -28,6 +31,20 @@ def test_camera_stream_emits_placeholder_when_frame_missing() -> None:
     frames = asyncio.run(collect())
     assert len(frames) == 1
     assert frames[0]
+
+
+def test_missing_camera_is_not_reopened_for_every_frame() -> None:
+    config = RobotConfig(camera_source="usb", simulation=False, camera_index=99)
+    camera = Camera(config)
+    capture = MagicMock()
+    capture.isOpened.return_value = False
+
+    with patch("camera.camera.cv2.VideoCapture", return_value=capture) as open_camera:
+        camera.open()
+        camera.open()
+
+    open_camera.assert_called_once_with(config.camera_index)
+    capture.release.assert_called_once()
 
 
 def test_lidar_parse_scan_text_supports_multiple_separators() -> None:

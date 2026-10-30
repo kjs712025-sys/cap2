@@ -195,6 +195,30 @@ Endpoints:
 - GET `/navigation/stream` — Server-Sent Events feed of the snapshot (~4 Hz) for the dashboard radar
 - POST `/navigation/start` / POST `/navigation/stop` — compatibility aliases
   for selecting Nav2 autonomous / manual mode; they do not arm the motors
+- POST `/nav2/mission/start` with `{}` — starts Nav2 and SLAM as needed, waits
+  for an active `NavigateToPose` action server, a fresh ROS map, and a physical
+  LiDAR scan, then claims control and arms the STM32 while waiting for an
+  explicit goal. It does not move until a goal is sent.
+- POST `/nav2/goal` with `{ "x": 1.0, "y": 0.5, "yaw": 0.0 }` — sends a
+  map-frame goal to Nav2 `NavigateToPose`. The controller uses MPPI's Omni
+  motion model for holonomic movement and plans against the live costmap.
+- POST `/nav2/cancel` or `/nav2/release` — cancel the current goal or release
+  control and disarm the STM32.
+- POST `/nav2/speed` with `{ "max_linear_speed_mps": 0.05 }` — adjust the
+  runtime translation-speed cap. The dashboard slider supports 0.01–1.00 m/s;
+  diagonal motion is capped by its combined x/y speed. Angular speed is
+  unchanged. The setting resets to 1.00 m/s when the backend restarts.
+- POST `/navigation/roam/start` / `/navigation/roam/stop` — start or stop the
+  existing LiDAR-reactive free-roam mode. It requires a fresh physical scan
+  and a connected STM32 and cannot run while Nav2 owns control.
+- POST `/nav2/patrol/record/start` and `/nav2/patrol/record/stop` — record a
+  manually driven route while SLAM is publishing a fresh map pose. The route
+  is stored in `maps/nav2_patrol_route.json`.
+- POST `/nav2/patrol/start` with `{ "repeat": true }` — prepare Nav2/SLAM if
+  needed, then navigate the saved map-frame waypoints in order. Each next
+  waypoint is issued only after Nav2 reports success; a failed action stops
+  the patrol and releases motor control. POST `/nav2/patrol/stop` cancels the
+  patrol and disarms the STM32.
 
 #### Nav2 using the existing STM32 and LiDAR
 
@@ -205,6 +229,27 @@ commands back through the backend. Do not start a second ROS serial driver for
 the LiDAR or STM32. The old reactive navigator and Nav2 must not drive at the
 same time; the backend control lease rejects conflicting commands.
 
+Nav2 uses the MPPI controller with its Omni motion model, costmap obstacle
+layers, velocity smoothing, and collision monitor, following the high-level
+architecture of OrbiBot V1. The existing YDLIDAR and backend-owned STM32
+protocol are retained; no additional hardware driver or firmware is used.
+The controller runs at 10 Hz with a 0.1 s MPPI model interval (40 prediction
+steps); these intervals must stay aligned for the Nav2 controller lifecycle to
+configure successfully.
+
+The dashboard also offers LiDAR-reactive free roam and a separate teach-and-
+repeat patrol mode. To make a patrol route, keep SLAM running, start **수동
+경로 기록**, drive the intended route with the manual controls, then choose
+**기록 저장**. **저장 경로 순찰** follows the saved SLAM map-frame poses using
+Nav2 and can repeat the route. The route is sampled as the robot moves or turns;
+the bridge obtains its map pose from the live `map → base_link` TF. If pose
+updates become stale, recording is cancelled. Because route points are stored
+in the SLAM map frame, after restarting SLAM place the robot at the same
+starting position and heading used when recording before replaying a saved
+route. Free roam uses the existing reactive LiDAR controller and remains
+mutually exclusive with route patrol and Nav2 control. Both modes retain the
+existing LiDAR and motor interlocks.
+
 The Nav2 bridge estimates `odom → base_link` by integrating commanded velocity.
 `slam_toolbox` uses LiDAR scan matching to publish map corrections. This is
 open-loop odometry, not wheel feedback: wheel slip, load, uneven floors, and
@@ -213,7 +258,12 @@ It is intended for supervised, low-speed evaluation, not safety-rated
 autonomy. The provisional outer footprint (340 × 250 mm) and centered LiDAR
 pose are in [`nav2/omnibot_geometry.yaml`](nav2/omnibot_geometry.yaml); verify
 them physically before navigation.
-The speed limits below constrain command values, not measured wheel speed:
+MPPI and the velocity smoother currently allow x/y command values up to
+±1.00 m/s and angular velocity up to ±0.25 rad/s. Runtime translation speed
+is capped by the dashboard setting (default 1.00 m/s). These are command
+limits, not measured wheel speeds. The currently retained STM32 firmware
+clamps each linear component to ±0.50 m/s internally; raising that firmware
+limit requires an explicit firmware update and hardware revalidation:
 the existing STM32 firmware has no velocity feedback, so actual speed must be
 measured and calibrated before any floor test.
 
@@ -244,19 +294,24 @@ ros2 service call /omnibot/arm std_srvs/srv/Trigger "{}"
 ```
 
 Send a Nav2 goal only after sensor orientation, scan matching, and the
-open-loop odometry have been checked. The bridge and backend cap linear
-velocity setpoints to 0.10 m/s and angular setpoints to 0.25 rad/s; these are
-not measured physical-speed limits. Release control to stop and disarm:
+open-loop odometry have been checked. The bridge and backend cap translation velocity setpoints to 0.50 m/s and
+angular setpoints to 0.25 rad/s; these are not measured physical-speed limits.
+Release control to stop and disarm:
 
 ```bash
 ros2 service call /omnibot/release_control std_srvs/srv/Trigger "{}"
 ```
 
-The dashboard's **자율주행 (Nav2)** mode button reserves control for Nav2 only
-after the ROS 2 Nav2 stack is running. It never arms the motors. The explicit
-**모터 무장** action performs the separate sensor/safety checks and asks for
-confirmation; only then can a goal move the robot. **수동조작** releases the
-lease and disarms.
+For the guided dashboard flow, press **자율주행 시작**. The dashboard starts
+Nav2 and SLAM as needed and waits for a fresh map and physical LiDAR scan
+before claiming control and arming the STM32. Enter a goal in the live map's
+coordinate frame by clicking a known-free map cell (which fills X/Y), choose
+the desired final yaw, then press **목표 전송**; the backend sends it to Nav2's
+`NavigateToPose` action. The MPPI Omni controller can use x/y motion to follow
+the planned path. The collision monitor and stale-scan release path remain
+enabled. Keep the robot supervised throughout motion; use **목표 취소**,
+**제어 해제·정지**, or emergency stop as appropriate. **수동조작** also
+releases the Nav2 lease and disarms.
 
 The dashboard starts the ROS backend bridge and Nav2 independently from the
 **Autonomous navigation → ROS 2 Jazzy · Nav2** panel. The separate
@@ -264,6 +319,10 @@ The dashboard starts the ROS backend bridge and Nav2 independently from the
 canvas displays the live ROS `/map` occupancy grid; **지도 저장** invokes
 `nav2_map_server map_saver_cli` and then exposes YAML and PGM downloads. The
 files are written under `maps/nav2_map.*` in the project directory.
+Dashboard manual driving also feeds its setpoints to ROS open-loop odometry,
+so SLAM can track movement made through the dashboard. This remains an estimate
+of commanded motion, not measured wheel rotation; hand-pushing the robot,
+wheel slip, or motor imbalance can still cause the pose and map to drift.
 
 Starting either ROS component does not move the robot. On real hardware,
 explicit arming is disabled until SLAM is running and a fresh ROS map is being
@@ -430,10 +489,19 @@ stream and command endpoint plus whether auth is required.
 
 The backend runs a background fire/smoke monitor on the camera feed every
 `ROBOT_FIRE_MONITOR_INTERVAL` seconds (default 2). Detection uses a **local
-YOLOv8** model — no cloud API key required — with weights at
-`models/fire_detection/fire_yolov8s.pt` (trained fire/smoke model from
+YOLOv8** model — no cloud API key required. By default it loads the Ultralytics
+NCNN export in `models/fire_detection/fire_ncnn_model` from
+[chan3082/firebot](https://github.com/chan3082/firebot), with `fire` and
+`smoke` classes. The model metadata specifies the AGPL-3.0 license. The
+bundled NCNN runtime is used directly, so the default model does not require
+PyTorch or CUDA.
+
+To select the existing PyTorch weights instead, set
+`ROBOT_FIRE_MODEL_PATH=models/fire_detection/fire_yolov8s.pt`. This legacy
+PyTorch path requires the optional `ultralytics` package (`pip install
+ultralytics`). The weights are trained fire/smoke model from
 [Abonia1/YOLOv8-Fire-and-Smoke-Detection](https://github.com/Abonia1/YOLOv8-Fire-and-Smoke-Detection),
-`runs/detect/train/weights/best.pt`). Requires the `ultralytics` package.
+`runs/detect/train/weights/best.pt`.
 
 Because this model is prone to false positives on bright indoor lighting,
 the response is two-tier:
@@ -461,7 +529,7 @@ navigation halt entirely.
 
 Tune `ROBOT_FIRE_WARN_CONFIDENCE` / `ROBOT_FIRE_STOP_CONFIDENCE` /
 `ROBOT_FIRE_AUTO_STOP` / `ROBOT_FIRE_HALT_CONSECUTIVE`, point
-`ROBOT_FIRE_MODEL_PATH` at a better model, or set
+`ROBOT_FIRE_MODEL_PATH` at another compatible model, or set
 `ROBOT_FIRE_MONITOR_ENABLED=0` to disable the monitor entirely. The
 Gemini-based `/camera/analyze` object analysis is unchanged and still requires
 `GEMINI_API_KEY`.

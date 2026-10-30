@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import asyncio
+import time
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -41,7 +43,7 @@ def _make_navigator() -> tuple[AutonomousNavigator, MagicMock, RobotStatus]:
         stm32=stm32,
         status=status,
         slam=slam,
-        config=RobotConfig(debug=True),
+        config=RobotConfig(debug=True, simulation=True),
         event_logger=None,
     )
     return nav, stm32, status
@@ -53,6 +55,13 @@ def test_sector_distances_cover_the_scan() -> None:
     assert sectors["front"]["count"] > 0
     assert sectors["front"]["min_distance"] == 1.5
     assert sectors["rear"]["count"] > 0
+
+
+def test_safe_direction_stops_when_forward_coverage_is_missing() -> None:
+    detector = ObstacleDetector()
+
+    assert detector.safe_direction([]) == "stop"
+    assert detector.safe_direction([ScanPoint(angle_deg=90.0, distance_m=2.0)]) == "stop"
 
 
 def test_disabled_navigator_sends_no_motion() -> None:
@@ -68,6 +77,32 @@ def test_enabled_navigator_cruises_when_path_is_clear() -> None:
     nav.step(_ring(2.5))
     assert nav.state["decision"] == "cruise"
     assert nav.state["velocity"]["vx"] > 0.0
+
+
+def test_enabled_navigator_disarms_when_forward_lidar_coverage_is_missing() -> None:
+    nav, stm32, _ = _make_navigator()
+    nav.enable()
+
+    nav.step([])
+
+    assert nav.enabled is False
+    assert nav.state["decision"] == "blocked"
+    assert nav.state["velocity"] == {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+    stm32.disarm.assert_called_once()
+
+
+def test_enabled_navigator_disarms_when_physical_scan_is_stale() -> None:
+    nav, stm32, _ = _make_navigator()
+    nav.config.simulation = False
+    nav.lidar.status.last_scan_hardware = True
+    nav.lidar.status.last_scan_at = time.monotonic() - 2.0
+    nav.enable()
+
+    nav.step(_ring(2.5))
+
+    assert nav.enabled is False
+    assert nav.state["decision"] == "blocked"
+    stm32.disarm.assert_called_once()
 
 
 def test_enabled_navigator_turns_away_from_a_front_obstacle() -> None:
@@ -86,6 +121,24 @@ def test_navigator_holds_still_under_emergency_stop() -> None:
     nav.step(_ring(2.5))
     assert nav.state["decision"] == "halted"
     assert nav.state["velocity"] == {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+
+
+def test_camera_frame_read_does_not_block_navigation_event_loop() -> None:
+    nav, _, _ = _make_navigator()
+    nav.config.simulation = False
+    nav.camera = MagicMock()
+    nav.use_camera = True
+    frame = MagicMock()
+    nav.camera.read_frame.side_effect = lambda: (time.sleep(0.1), frame)[1]
+
+    async def verify_event_loop_stays_responsive() -> None:
+        refresh = asyncio.create_task(nav._refresh_camera())
+        await asyncio.sleep(0.01)
+        assert not refresh.done()
+        await refresh
+
+    with patch.object(nav.camera_estimator, "estimate", return_value={"available": True, "sectors": {}}):
+        asyncio.run(verify_event_loop_stays_responsive())
 
 
 def test_navigation_endpoints_toggle_state() -> None:
@@ -126,6 +179,7 @@ def test_nav_autostart_enables_navigator_after_delay() -> None:
     app = create_app(
         RobotConfig(
             debug=True,
+            simulation=True,
             llm_enabled=False,
             enable_websocket=False,
             nav_autostart=True,

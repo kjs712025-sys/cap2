@@ -46,7 +46,7 @@ def test_partial_rotation_is_not_nav_ready(monkeypatch) -> None:
     sensor.status.connected = True
     sensor.serial = object()
     sensor._read_packet = lambda: (10.0, 20.0, [4000, 4000])
-    clock_values = iter([0.0, 0.1, 0.6])
+    clock_values = iter([0.0, 0.1, 0.6, 0.6])
     monkeypatch.setattr(lidar_module.time, "monotonic", lambda: next(clock_values))
 
     scan = sensor._read_scan_locked()

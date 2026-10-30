@@ -16,7 +16,7 @@ bt_navigator:
 controller_server:
   ros__parameters:
     use_sim_time: false
-    controller_frequency: 3.0
+    controller_frequency: 10.0
     costmap_update_timeout: 1.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
@@ -35,44 +35,81 @@ controller_server:
       xy_goal_tolerance: 0.15
       yaw_goal_tolerance: 0.25
     FollowPath:
-      plugin: "dwb_core::DWBLocalPlanner"
-      debug_trajectory_details: false
-      min_vel_x: -0.10
-      min_vel_y: -0.10
-      max_vel_x: 0.10
-      max_vel_y: 0.10
-      max_vel_theta: 0.25
-      min_speed_xy: 0.0
-      max_speed_xy: 0.10
-      min_speed_theta: 0.0
-      acc_lim_x: 0.20
-      acc_lim_y: 0.20
-      acc_lim_theta: 0.40
-      decel_lim_x: -0.20
-      decel_lim_y: -0.20
-      decel_lim_theta: -0.40
-      vx_samples: 5
-      vy_samples: 5
-      vtheta_samples: 7
-      sim_time: 1.0
-      linear_granularity: 0.05
-      angular_granularity: 0.05
+      plugin: "nav2_mppi_controller::MPPIController"
+      motion_model: "Omni"
+      time_steps: 40
+      model_dt: 0.1
+      batch_size: 1000
+      iteration_count: 1
+      vx_max: 1.00
+      vx_min: -1.00
+      vy_max: 1.00
+      vy_min: -1.00
+      wz_max: 0.25
+      wz_min: -0.25
+      ax_max: 0.20
+      ax_min: -0.20
+      ay_max: 0.20
+      ay_min: -0.20
+      az_max: 0.40
+      az_min: -0.40
+      vx_std: 0.30
+      vy_std: 0.30
+      wz_std: 0.08
       transform_tolerance: 0.3
-      xy_goal_tolerance: 0.15
-      trans_stopped_velocity: 0.02
-      short_circuit_trajectory_evaluation: true
-      stateful: true
-      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      BaseObstacle.scale: 0.02
-      PathAlign.scale: 16.0
-      PathAlign.forward_point_distance: 0.1
-      GoalAlign.scale: 12.0
-      GoalAlign.forward_point_distance: 0.1
-      PathDist.scale: 24.0
-      GoalDist.scale: 20.0
-      RotateToGoal.scale: 20.0
-      RotateToGoal.slowing_factor: 5.0
-      RotateToGoal.lookahead_time: -1.0
+      prune_distance: 1.0
+      temperature: 0.3
+      gamma: 0.015
+      visualize: false
+      regenerate_noises: true
+      critics: ["ConstraintCritic", "CostCritic", "GoalCritic", "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic", "PathAngleCritic"]
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      CostCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.81
+        near_collision_cost: 253
+        critical_cost: 300.0
+        consider_footprint: true
+        collision_cost: 1000000.0
+        near_goal_distance: 0.5
+        trajectory_point_step: 1
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.0
+      GoalAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 14.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 10
+        use_path_orientations: false
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.0
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        mode: 1
 
 local_costmap:
   local_costmap:
@@ -83,8 +120,8 @@ local_costmap:
       global_frame: odom
       robot_base_frame: base_link
       rolling_window: true
-      width: 3.0
-      height: 3.0
+      width: 3
+      height: 3
       resolution: 0.05
       footprint: "[[-0.17, -0.125], [0.17, -0.125], [0.17, 0.125], [-0.17, 0.125]]"
       plugins: ["obstacle_layer", "inflation_layer"]
@@ -196,8 +233,8 @@ velocity_smoother:
     smoothing_frequency: 10.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [0.10, 0.10, 0.25]
-    min_velocity: [-0.10, -0.10, -0.25]
+    max_velocity: [1.00, 1.00, 0.25]
+    min_velocity: [-1.00, -1.00, -0.25]
     max_accel: [0.20, 0.20, 0.40]
     max_decel: [-0.20, -0.20, -0.40]
     odom_topic: /odom
@@ -243,3 +280,39 @@ waypoint_follower:
       plugin: "nav2_waypoint_follower::WaitAtWaypoint"
       enabled: true
       waypoint_pause_duration: 0
+
+docking_server:
+  ros__parameters:
+    use_sim_time: false
+    controller_frequency: 50.0
+    initial_perception_timeout: 5.0
+    wait_charge_timeout: 5.0
+    dock_approach_timeout: 30.0
+    undock_linear_tolerance: 0.05
+    undock_angular_tolerance: 0.1
+    max_retries: 3
+    base_frame: "base_link"
+    fixed_frame: "odom"
+    dock_backwards: false
+    dock_prestaging_tolerance: 0.5
+    dock_plugins: ["simple_charging_dock"]
+    simple_charging_dock:
+      plugin: "opennav_docking::SimpleChargingDock"
+      docking_threshold: 0.05
+      staging_x_offset: -0.7
+      use_external_detection_pose: true
+      use_battery_status: false
+      use_stall_detection: false
+      external_detection_timeout: 1.0
+      external_detection_translation_x: -0.18
+      external_detection_translation_y: 0.0
+      external_detection_rotation_roll: -1.57
+      external_detection_rotation_pitch: -1.57
+      external_detection_rotation_yaw: 0.0
+      filter_coef: 0.1
+    controller:
+      k_phi: 3.0
+      k_delta: 2.0
+      v_linear_min: 0.15
+      v_linear_max: 0.15
+      use_collision_detection: true

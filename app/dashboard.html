@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0a0e10">
+  <meta name="theme-color" content="#0b1016">
   <title>OmniBot Dashboard</title>
-  <link rel="stylesheet" href="/app/dashboard.css?v=20">
+  <link rel="stylesheet" href="/app/dashboard.css?v=24">
 </head>
 <body>
   <main class="shell">
@@ -13,6 +13,7 @@
       <div>
         <p class="eyebrow">OMNIBOT · CONTROL</p>
         <h1 id="robot-name">Robot dashboard</h1>
+        <p class="topbar-subtitle">로봇 상태와 주행 기능을 한곳에서 확인하세요.</p>
       </div>
       <div class="topbar-right">
         <span id="simulation-badge" class="simulation-badge" hidden>SIMULATION · NO HARDWARE</span>
@@ -25,7 +26,7 @@
     <div id="fire-banner" class="fire-banner" hidden>🔥 FIRE DETECTED — robot halted</div>
 
     <div class="board">
-      <section class="panel wide">
+      <section class="panel wide" id="overview-panel">
         <div class="panel-heading"><h2>Robot status</h2><button id="refresh-button" class="icon-button" type="button">Refresh</button></div>
         <div class="grid grid-4">
           <div class="stat"><span>Mode</span><strong id="mode">--</strong></div>
@@ -41,16 +42,15 @@
         </div>
       </section>
 
-      <section class="panel wide">
+      <section class="panel wide" id="mode-panel">
         <div class="panel-heading"><h2>Control mode</h2><span id="mode-indicator" class="uptime">mode --</span></div>
         <div class="mode-toggle">
           <button id="mode-manual-btn" class="mode-btn" type="button">🕹️ 수동조작<span>Manual</span></button>
-          <button id="mode-auto-btn" class="mode-btn" type="button">🤖 자율주행 (Nav2)<span>ROS 2 Nav2</span></button>
         </div>
-        <p class="hint" id="mode-hint">Nav2 스택을 시작한 뒤 선택하세요. 모드 전환은 제어권만 예약하며 모터를 무장하지 않습니다. 별도 무장 확인 후 목표를 전송하세요.</p>
+        <p class="hint" id="mode-hint">자율주행은 Nav2 패널의 시작 버튼 한 번으로 실행합니다. 수동조작을 다시 선택하면 자율주행 제어를 해제하고 모터를 정지합니다.</p>
       </section>
 
-      <section class="panel wide">
+      <section class="panel wide" id="hardware-panel">
         <div class="panel-heading"><h2>Hardware</h2></div>
         <div class="grid grid-3">
           <div class="hw-card" id="hw-stm32">
@@ -72,7 +72,7 @@
         </div>
       </section>
 
-      <section class="panel wide">
+      <section class="panel wide" id="system-health-panel">
         <div class="panel-heading">
           <h2>System health</h2>
           <span id="fire-monitor-state" class="uptime">fire monitor --</span>
@@ -86,7 +86,7 @@
         <p id="fire-monitor-detail" class="hw-detail system-note"></p>
       </section>
 
-      <section class="panel wide">
+      <section class="panel wide" id="nav2-panel">
         <div class="panel-heading">
           <h2>Autonomous navigation</h2>
           <span id="nav-stream-state" class="uptime">stream --</span>
@@ -96,19 +96,39 @@
             <strong>ROS 2 Jazzy · Nav2</strong>
             <span id="nav2-stack-state" class="badge offline">not running</span>
           </div>
-          <p class="hw-detail">엔코더 미사용 · 명령 적분 오도메트리(개루프). 스택 시작만으로는 모터가 무장되지 않습니다. 바닥 주행 전 안전 검증이 필요합니다.</p>
+          <p class="hw-detail">LiDAR 스캔과 실시간 SLAM 지도를 확인하세요. 자율주행 시작은 Nav2와 SLAM을 준비하고 제어권을 확보합니다. 지도의 좌표계 기준으로 목표 X/Y와 도착 방향을 입력한 뒤 목표 전송을 누르면 Nav2 MPPI가 메카넘 방향 이동을 포함해 경로를 추종합니다. 충돌 감시와 LiDAR 연결 감시는 유지됩니다. 이동 중에는 계속 감독하고 제어 해제·정지 또는 비상 정지 수단을 준비하세요.</p>
           <div class="nav2-buttons">
-            <button id="nav2-start-btn" class="icon-button" type="button">Nav2 스택 시작</button>
-            <button id="nav2-arm-btn" class="icon-button" type="button" disabled>모터 무장</button>
+            <button id="nav2-mission-start-btn" class="icon-button" type="button">자율주행 시작</button>
             <button id="nav2-release-btn" class="icon-button" type="button" disabled>제어 해제·정지</button>
             <button id="nav2-stop-btn" class="icon-button" type="button">Nav2 스택 종료</button>
           </div>
+          <label class="nav2-speed-control" for="nav2-speed">
+            <span>자율주행 최대 이동 속도 <strong id="nav2-speed-value">1.00 m/s</strong></span>
+            <input id="nav2-speed" type="range" min="0.01" max="1.00" step="0.01" value="1.00">
+            <small>전진·후진·평행이동 속도 상한 · 회전 속도 및 가속도 제한은 유지됩니다.</small>
+          </label>
           <div class="nav2-goal-row">
             <label>목표 X (m)<input id="nav2-goal-x" type="number" step="0.1" value="0.5"></label>
             <label>목표 Y (m)<input id="nav2-goal-y" type="number" step="0.1" value="0"></label>
             <label>방향 (deg)<input id="nav2-goal-yaw" type="number" step="5" value="0"></label>
             <button id="nav2-goal-btn" class="icon-button" type="button" disabled>목표 전송</button>
             <button id="nav2-cancel-btn" class="icon-button" type="button" disabled>목표 취소</button>
+          </div>
+          <div class="nav2-patrol-panel">
+            <strong>Firebot 스타일 주행</strong>
+            <p class="hw-detail">주변 탐색은 LiDAR 반응형 주행입니다. 경로 순찰은 SLAM 지도가 켜진 상태에서 수동 운전 경로를 기록한 다음 Nav2로 반복합니다. SLAM을 다시 시작한 뒤 저장 경로를 쓸 때는 기록을 시작했던 위치와 방향에 로봇을 놓으세요. 기록·순찰 중에도 주변을 감독하세요.</p>
+            <div class="nav2-buttons">
+              <button id="nav2-roam-start-btn" class="icon-button" type="button">주변 탐색 시작</button>
+              <button id="nav2-roam-stop-btn" class="icon-button" type="button" disabled>주변 탐색 중지</button>
+            </div>
+            <div class="nav2-buttons">
+              <button id="nav2-patrol-record-start-btn" class="icon-button" type="button">수동 경로 기록</button>
+              <button id="nav2-patrol-record-stop-btn" class="icon-button" type="button" disabled>기록 저장</button>
+              <label class="patrol-repeat-option"><input id="nav2-patrol-repeat" type="checkbox" checked> 반복 순찰</label>
+              <button id="nav2-patrol-start-btn" class="icon-button" type="button" disabled>저장 경로 순찰</button>
+              <button id="nav2-patrol-stop-btn" class="icon-button" type="button" disabled>순찰 중지·모터 해제</button>
+            </div>
+            <p id="nav2-patrol-message" class="hw-detail" role="status">저장 경로 없음 · SLAM 지도를 켜고 수동 경로를 기록하세요.</p>
           </div>
           <p id="nav2-message" class="hw-detail" role="status">상태 확인 중…</p>
         </div>
@@ -134,7 +154,7 @@
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="camera-panel">
         <div class="panel-heading"><h2>Camera</h2><button id="camera-refresh-btn" class="icon-button" type="button">Refresh</button></div>
         <img id="camera-feed" class="media-frame" alt="camera feed">
         <div class="media-actions">
@@ -144,7 +164,7 @@
         <p id="camera-result" class="hw-detail"></p>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="backend-slam-panel">
         <div class="panel-heading">
           <h2>Backend SLAM estimate</h2>
           <span id="slam-stream-state" class="uptime">stream --</span>
@@ -160,12 +180,12 @@
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="ros-slam-panel">
         <div class="panel-heading">
           <h2>ROS 2 SLAM Toolbox</h2>
           <span id="ros-slam-state" class="badge offline">stopped</span>
         </div>
-        <p class="hw-detail">Nav2와 분리해 SLAM mapping을 시작·종료합니다. 실제 ROS OccupancyGrid 지도이며 backend 추정 지도와 별도입니다.</p>
+        <p class="hw-detail">위의 시스템 준비 버튼으로 Nav2와 함께 시작하거나, 여기서 단독 실행할 수 있습니다. SLAM은 LiDAR로 지도를 만들며 시작만으로는 로봇이 움직이지 않습니다.</p>
         <div class="nav2-buttons ros-slam-buttons">
           <button id="ros-slam-start-btn" class="icon-button" type="button">SLAM 시작</button>
           <button id="ros-slam-stop-btn" class="icon-button" type="button" disabled>SLAM 종료</button>
@@ -177,27 +197,28 @@
         <div class="nav-radar-wrap ros-slam-map-wrap">
           <canvas id="ros-slam-canvas" width="420" height="420" class="nav-radar"></canvas>
           <p id="ros-slam-map-caption" class="nav-radar-cap">ROS /map occupancy grid</p>
+          <p class="hw-detail">목표 지점을 지도에서 클릭하면 목표 X/Y에 반영됩니다. 빈 공간만 선택할 수 있습니다.</p>
         </div>
       </section>
 
       <section class="panel" id="motion-panel">
         <div class="panel-heading"><h2>Motion control</h2><span class="badge manual-only-badge">manual only</span></div>
-        <p class="hw-detail">방향 버튼 클릭 시 짧게 이동하고, 길게 누르면 계속 이동합니다. 버튼을 놓으면 정지·모터 해제됩니다. 수동 명령 시 STM32가 자동 무장됩니다.</p>
+        <p class="hw-detail">방향 버튼 클릭 시 짧게 이동하고, 길게 누르면 계속 이동합니다. ←/→는 해당 방향 평행이동이며, 버튼을 놓으면 정지·모터 해제됩니다. 수동 명령 시 STM32가 자동 무장됩니다.</p>
         <div class="motion-grid">
           <div class="dpad">
             <button class="dpad-btn dpad-ccw" data-vx="0" data-vy="0" data-wz="0.6" type="button" aria-label="Rotate left">&#8634;</button>
             <button class="dpad-btn dpad-up" data-vx="0.2" data-vy="0" data-wz="0" type="button" aria-label="Forward">&#9650;</button>
             <button class="dpad-btn dpad-cw" data-vx="0" data-vy="0" data-wz="-0.6" type="button" aria-label="Rotate right">&#8635;</button>
-            <button class="dpad-btn dpad-left" data-vx="0" data-vy="-0.2" data-wz="0" type="button" aria-label="Strafe left">&#9664;</button>
+            <button class="dpad-btn dpad-left" data-vx="0" data-vy="0.2" data-wz="0" type="button" aria-label="Strafe left">&#9664;</button>
             <button class="dpad-btn dpad-stop" id="motion-stop-btn" type="button" aria-label="Stop">&#9632;</button>
-            <button class="dpad-btn dpad-right" data-vx="0" data-vy="0.2" data-wz="0" type="button" aria-label="Strafe right">&#9654;</button>
+            <button class="dpad-btn dpad-right" data-vx="0" data-vy="-0.2" data-wz="0" type="button" aria-label="Strafe right">&#9654;</button>
             <span></span>
             <button class="dpad-btn dpad-down" data-vx="-0.2" data-vy="0" data-wz="0" type="button" aria-label="Backward">&#9660;</button>
             <span></span>
           </div>
           <div class="motion-manual">
             <label>vx <input id="vx-input" type="number" step="0.05" value="0"></label>
-            <label>vy <input id="vy-input" type="number" step="0.05" value="0"></label>
+            <label>vy (+ left / − right) <input id="vy-input" type="number" step="0.05" value="0"></label>
             <label>wz <input id="wz-input" type="number" step="0.1" value="0"></label>
             <button id="motion-send-btn" class="icon-button" type="button">Send</button>
           </div>
@@ -220,7 +241,7 @@
         <p id="text-command-result" class="hw-detail"></p>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="emergency-panel">
         <div class="panel-heading"><h2>Emergency control</h2></div>
         <div class="estop-row">
           <p class="hint">Immediately halts motion and latches STM32 velocity commands. Clear resets to manual mode after a safety check.</p>
@@ -232,26 +253,37 @@
         <p id="error" class="error" role="alert"></p>
       </section>
 
-      <section class="panel">
-        <div class="panel-heading"><h2>Lidar scan</h2><button id="lidar-refresh-btn" class="icon-button" type="button">Scan</button></div>
+      <section class="panel" id="lidar-panel">
+        <div class="panel-heading">
+          <h2>LiDAR surroundings</h2>
+          <div class="topbar-right">
+            <span id="lidar-scan-state" class="uptime">waiting for scan</span>
+            <button id="lidar-refresh-btn" class="icon-button" type="button">Scan</button>
+          </div>
+        </div>
+        <div class="lidar-scan-wrap">
+          <canvas id="lidar-scan-canvas" width="420" height="420" role="img" aria-label="Live 360-degree LiDAR range scan"></canvas>
+          <p id="lidar-scan-caption" class="nav-radar-cap">front ↑ · range 6 m · scan pending</p>
+        </div>
         <div class="grid grid-3">
           <div class="stat"><span>Proximity</span><strong id="lidar-proximity">--</strong></div>
           <div class="stat"><span>Safe direction</span><strong id="lidar-safe-direction">--</strong></div>
           <div class="stat"><span>Obstacles</span><strong id="lidar-obstacles">--</strong></div>
         </div>
+        <p id="lidar-scan-error" class="hw-detail" role="status"></p>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="events-panel">
         <div class="panel-heading"><h2>Recent events</h2></div>
         <ul id="events-list" class="list"><li class="empty">No events yet</li></ul>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="alerts-panel">
         <div class="panel-heading"><h2>Recent alerts</h2></div>
         <ul id="alerts-list" class="list"><li class="empty">No alerts</li></ul>
       </section>
     </div>
   </main>
-  <script src="/app/dashboard.js?v=24"></script>
+  <script src="/app/dashboard.js?v=38"></script>
 </body>
 </html>

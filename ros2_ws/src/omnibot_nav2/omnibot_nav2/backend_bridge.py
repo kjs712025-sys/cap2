@@ -15,14 +15,17 @@ from typing import Any
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
+from lifecycle_msgs.msg import State as LifecycleState
+from lifecycle_msgs.srv import GetState
 from nav_msgs.msg import OccupancyGrid, Odometry
 from nav2_msgs.action import NavigateToPose
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Trigger
 from rclpy.action import ActionClient
-from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
+from tf2_ros import Buffer, StaticTransformBroadcaster, TransformBroadcaster, TransformException, TransformListener
 
 
 _SCAN_BINS = 360
@@ -30,10 +33,18 @@ _SCAN_MIN_ANGLE = -math.pi
 _SCAN_INCREMENT = 2.0 * math.pi / _SCAN_BINS
 _RANGE_MIN_M = 0.12
 _RANGE_MAX_M = 12.0
-_MAX_LINEAR_MPS = 0.10
+_MAX_LINEAR_MPS = 1.00
 _MAX_ANGULAR_RPS = 0.25
+_MAX_MANUAL_ODOM_LINEAR_MPS = 0.5
+_MAX_MANUAL_ODOM_ANGULAR_RPS = 1.0
 _COMMAND_TIMEOUT_S = 0.30
 _SCAN_TIMEOUT_S = 1.2
+_BACKEND_REQUEST_TIMEOUT_S = 2.0
+_LIDAR_REQUEST_TIMEOUT_S = 2.0
+
+
+class BackendRejectedError(RuntimeError):
+    """A completed backend response rejected a bridge request."""
 
 
 class OmniBotBackendBridge(Node):
@@ -43,7 +54,7 @@ class OmniBotBackendBridge(Node):
         super().__init__("omnibot_backend_bridge")
         self.declare_parameter("backend_url", "http://127.0.0.1:8000")
         self.declare_parameter("api_token", os.getenv("ROBOT_API_TOKEN", ""))
-        self.declare_parameter("scan_poll_period", 0.5)
+        self.declare_parameter("scan_poll_period", 0.1)
         self.declare_parameter("lidar_x", 0.0)
         self.declare_parameter("lidar_y", 0.0)
         self.declare_parameter("lidar_z", 0.16)
@@ -62,12 +73,23 @@ class OmniBotBackendBridge(Node):
         self._vx = 0.0
         self._vy = 0.0
         self._wz = 0.0
+        self._nav2_action_ready = False
+        self._readiness_request_pending = False
+        self._manual_odom_vx = 0.0
+        self._manual_odom_vy = 0.0
+        self._manual_odom_wz = 0.0
+        self._manual_odom_received_at = 0.0
         self._last_command_at = 0.0
         self._last_scan_at = 0.0
         self._goal_sequence = 0
         self._cancel_sequence = 0
         self._goal_events: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._goal_results: queue.Queue[dict[str, int]] = queue.Queue()
         self._goal_handle = None
+        self._goal_handle_sequence = 0
+        self._map_pose: dict[str, float] | None = None
+        self._map_pose_captured_at = 0.0
+        self._last_map_pose_report_at = 0.0
         self._last_odom_at = time.monotonic()
         self._x = 0.0
         self._y = 0.0
@@ -91,12 +113,17 @@ class OmniBotBackendBridge(Node):
         )
         self._cmd_sub = self.create_subscription(Twist, "/cmd_vel", self._on_cmd_vel, 10)
         self._navigate_client = ActionClient(self, NavigateToPose, "/navigate_to_pose")
+        self._bt_navigator_state_client = self.create_client(GetState, "/bt_navigator/get_state")
         self._claim_srv = self.create_service(Trigger, "/omnibot/claim_control", self._claim)
         self._arm_srv = self.create_service(Trigger, "/omnibot/arm", self._arm)
         self._release_srv = self.create_service(Trigger, "/omnibot/release_control", self._release)
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
         self._odom_timer = self.create_timer(0.05, self._publish_odometry)
         self._heartbeat_timer = self.create_timer(0.2, self._send_heartbeat)
         self._goal_timer = self.create_timer(0.1, self._dispatch_goal_events)
+        self._readiness_timer = self.create_timer(0.5, self._check_nav2_readiness)
+        self._map_pose_timer = self.create_timer(0.1, self._capture_map_pose)
 
         self._tf_broadcaster = TransformBroadcaster(self)
         static_tf = TransformStamped()
@@ -135,13 +162,18 @@ class OmniBotBackendBridge(Node):
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=0.4) as response:
+            timeout = (
+                _LIDAR_REQUEST_TIMEOUT_S
+                if path == "/lidar/scan"
+                else _BACKEND_REQUEST_TIMEOUT_S
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, ValueError) as exc:
             raise RuntimeError(f"backend request {method} {path} failed: {exc}") from exc
         if not isinstance(body, dict) or body.get("success") is not True:
             message = body.get("message", "invalid backend response") if isinstance(body, dict) else "invalid backend response"
-            raise RuntimeError(f"backend rejected {method} {path}: {message}")
+            raise BackendRejectedError(f"backend rejected {method} {path}: {message}")
         return body
 
     def _log_throttled(self, key: str, message: str) -> None:
@@ -198,12 +230,20 @@ class OmniBotBackendBridge(Node):
                 self._log_throttled("map_publish", f"Could not forward the ROS SLAM map: {exc}")
 
     def _goal_poll_loop(self) -> None:
+        next_readiness_report = 0.0
         while not self._stop_goal_worker.is_set():
             try:
                 data = self._request(
                     "GET",
                     f"/nav2/goal/next?after={self._goal_sequence}",
                 )["data"]
+                control_claimed = bool(data["control_claimed"])
+                armed = bool(data["armed"])
+                with self._lock:
+                    self._claimed = control_claimed
+                    self._armed = armed if control_claimed else False
+                    if not self._claimed or not self._armed:
+                        self._vx = self._vy = self._wz = 0.0
                 cancel_sequence = int(data["cancel_sequence"])
                 if cancel_sequence != self._cancel_sequence:
                     self._cancel_sequence = cancel_sequence
@@ -212,10 +252,132 @@ class OmniBotBackendBridge(Node):
                 goal = data.get("goal")
                 if goal is not None and sequence > self._goal_sequence:
                     self._goal_sequence = sequence
-                    self._goal_events.put({"type": "goal", "goal": goal})
+                    self._goal_events.put(
+                        {"type": "goal", "sequence": sequence, "goal": goal}
+                    )
             except (KeyError, TypeError, ValueError, RuntimeError) as exc:
                 self._log_throttled("goal_poll", f"Nav2 goal polling failed: {exc}")
+            self._poll_manual_odometry()
+            now = time.monotonic()
+            with self._lock:
+                map_pose = self._map_pose
+                pose_is_fresh = now - self._map_pose_captured_at <= 0.5
+            if map_pose is not None and pose_is_fresh and now - self._last_map_pose_report_at >= 0.2:
+                try:
+                    self._request("POST", "/nav2/bridge/pose", map_pose)
+                except RuntimeError as exc:
+                    self._log_throttled("map_pose", f"Could not report SLAM map pose: {exc}")
+                self._last_map_pose_report_at = now
+            while True:
+                try:
+                    result = self._goal_results.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._request("POST", "/nav2/goal/result", result)
+                except RuntimeError as exc:
+                    self._log_throttled("goal_result", f"Could not report Nav2 goal result: {exc}")
+            if time.monotonic() >= next_readiness_report:
+                with self._lock:
+                    nav2_action_ready = self._nav2_action_ready
+                try:
+                    self._request(
+                        "POST",
+                        "/nav2/bridge/status",
+                        {"nav2_action_ready": nav2_action_ready},
+                    )
+                except RuntimeError as exc:
+                    self._log_throttled("nav2_readiness", f"Could not report Nav2 readiness: {exc}")
+                next_readiness_report = time.monotonic() + 0.5
             self._stop_goal_worker.wait(0.2)
+
+    def _check_nav2_readiness(self) -> None:
+        with self._lock:
+            if self._readiness_request_pending:
+                return
+            self._readiness_request_pending = True
+        if not self._bt_navigator_state_client.service_is_ready():
+            with self._lock:
+                self._nav2_action_ready = False
+                self._readiness_request_pending = False
+            return
+        try:
+            future = self._bt_navigator_state_client.call_async(GetState.Request())
+        except RuntimeError as exc:
+            with self._lock:
+                self._nav2_action_ready = False
+                self._readiness_request_pending = False
+            self._log_throttled("nav2_lifecycle", f"Could not query Nav2 lifecycle state: {exc}")
+            return
+        future.add_done_callback(self._on_nav2_lifecycle_state)
+
+    def _capture_map_pose(self) -> None:
+        try:
+            transform = self._tf_buffer.lookup_transform("map", "base_link", Time())
+        except TransformException as exc:
+            with self._lock:
+                self._map_pose = None
+                self._map_pose_captured_at = 0.0
+            self._log_throttled("map_pose_tf", f"SLAM map pose is unavailable: {exc}")
+            return
+
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+        pose = {
+            "x": float(translation.x),
+            "y": float(translation.y),
+            "yaw": math.atan2(
+                2.0 * (rotation.w * rotation.z + rotation.x * rotation.y),
+                1.0 - 2.0 * (rotation.y**2 + rotation.z**2),
+            ),
+        }
+        if not all(math.isfinite(value) for value in pose.values()):
+            with self._lock:
+                self._map_pose = None
+                self._map_pose_captured_at = 0.0
+            self._log_throttled("map_pose_tf", "SLAM map pose contains a non-finite value")
+            return
+        with self._lock:
+            self._map_pose = pose
+            self._map_pose_captured_at = time.monotonic()
+
+    def _on_nav2_lifecycle_state(self, future: Any) -> None:
+        try:
+            response = future.result()
+            ready = (
+                response.current_state.id == LifecycleState.PRIMARY_STATE_ACTIVE
+                and self._navigate_client.server_is_ready()
+            )
+        except (AttributeError, RuntimeError) as exc:
+            ready = False
+            self._log_throttled("nav2_lifecycle", f"Could not read Nav2 lifecycle state: {exc}")
+        with self._lock:
+            self._nav2_action_ready = ready
+            self._readiness_request_pending = False
+
+    def _poll_manual_odometry(self) -> None:
+        try:
+            data = self._request("GET", "/nav2/odometry/command")["data"]["command"]
+            command = {
+                axis: max(-_MAX_MANUAL_ODOM_LINEAR_MPS, min(_MAX_MANUAL_ODOM_LINEAR_MPS, float(data[axis])))
+                for axis in ("vx", "vy")
+            }
+            command["wz"] = max(
+                -_MAX_MANUAL_ODOM_ANGULAR_RPS,
+                min(_MAX_MANUAL_ODOM_ANGULAR_RPS, float(data["wz"])),
+            )
+            if not all(math.isfinite(value) for value in command.values()):
+                raise ValueError("manual odometry command must be finite")
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            self._log_throttled("manual_odometry", f"Manual odometry polling failed: {exc}")
+            return
+        with self._lock:
+            if self._claimed:
+                return
+            self._manual_odom_vx = command["vx"]
+            self._manual_odom_vy = command["vy"]
+            self._manual_odom_wz = command["wz"]
+            self._manual_odom_received_at = time.monotonic()
 
     def _dispatch_goal_events(self) -> None:
         while True:
@@ -224,13 +386,18 @@ class OmniBotBackendBridge(Node):
             except queue.Empty:
                 return
             if event["type"] == "cancel":
-                self._navigate_client.cancel_all_goals_async()
+                if self._goal_handle is not None:
+                    self._goal_handle.cancel_goal_async()
                 self._goal_handle = None
+                self._goal_handle_sequence = 0
                 continue
             if event["type"] != "goal":
                 continue
             if not self._navigate_client.server_is_ready():
                 self.get_logger().error("Nav2 NavigateToPose action server is unavailable; goal discarded.")
+                self._goal_results.put(
+                    {"sequence": int(event["sequence"]), "status": 6}
+                )
                 continue
             goal_data = event["goal"]
             goal = NavigateToPose.Goal()
@@ -242,32 +409,51 @@ class OmniBotBackendBridge(Node):
             yaw = float(goal_data["yaw"])
             goal.pose.pose.orientation.z = math.sin(yaw * 0.5)
             goal.pose.pose.orientation.w = math.cos(yaw * 0.5)
+            sequence = int(event["sequence"])
             future = self._navigate_client.send_goal_async(goal)
-            future.add_done_callback(self._on_goal_response)
+            future.add_done_callback(
+                lambda result_future, goal_sequence=sequence: self._on_goal_response(
+                    result_future,
+                    goal_sequence,
+                )
+            )
             self.get_logger().info(
                 f"Nav2 goal dispatched at map x={goal_data['x']:.2f} y={goal_data['y']:.2f} yaw={yaw:.2f}"
             )
 
-    def _on_goal_response(self, future: Any) -> None:
+    def _on_goal_response(self, future: Any, sequence: int) -> None:
         try:
             handle = future.result()
-        except Exception as exc:
+        except (AttributeError, RuntimeError) as exc:
             self.get_logger().error(f"Nav2 rejected goal request: {exc}")
+            self._goal_results.put({"sequence": sequence, "status": 6})
             return
         if not handle.accepted:
             self.get_logger().error("Nav2 rejected the goal.")
+            self._goal_results.put({"sequence": sequence, "status": 6})
             return
         self._goal_handle = handle
+        self._goal_handle_sequence = sequence
         result_future = handle.get_result_async()
-        result_future.add_done_callback(self._on_goal_result)
+        result_future.add_done_callback(
+            lambda result_future, goal_sequence=sequence: self._on_goal_result(
+                result_future,
+                goal_sequence,
+            )
+        )
 
-    def _on_goal_result(self, future: Any) -> None:
+    def _on_goal_result(self, future: Any, sequence: int) -> None:
         try:
             result = future.result()
-            self.get_logger().info(f"Nav2 goal finished with status {result.status}.")
-        except Exception as exc:
+            status = int(result.status)
+            self.get_logger().info(f"Nav2 goal finished with status {status}.")
+            self._goal_results.put({"sequence": sequence, "status": status})
+        except (AttributeError, RuntimeError) as exc:
             self.get_logger().error(f"Could not read Nav2 goal result: {exc}")
-        self._goal_handle = None
+            self._goal_results.put({"sequence": sequence, "status": 6})
+        if self._goal_handle_sequence == sequence:
+            self._goal_handle = None
+            self._goal_handle_sequence = 0
 
     def _scan_loop(self) -> None:
         while not self._stop_scanner.is_set():
@@ -328,6 +514,8 @@ class OmniBotBackendBridge(Node):
             self._claimed = True
             self._armed = False
             self._vx = self._vy = self._wz = 0.0
+            self._manual_odom_vx = self._manual_odom_vy = self._manual_odom_wz = 0.0
+            self._manual_odom_received_at = 0.0
             self._last_command_at = time.monotonic()
         response.success = True
         response.message = "Nav2 control claimed; motors remain disarmed."
@@ -369,6 +557,8 @@ class OmniBotBackendBridge(Node):
             self._claimed = False
             self._armed = False
             self._vx = self._vy = self._wz = 0.0
+            self._manual_odom_vx = self._manual_odom_vy = self._manual_odom_wz = 0.0
+            self._manual_odom_received_at = 0.0
         response.success = True
         response.message = "Nav2 control released and STM32 disarmed."
         return response
@@ -440,12 +630,14 @@ class OmniBotBackendBridge(Node):
             return
         try:
             self._request("POST", "/nav2/heartbeat", {})
-        except RuntimeError as exc:
+        except BackendRejectedError as exc:
             with self._lock:
                 self._claimed = False
                 self._armed = False
                 self._vx = self._vy = self._wz = 0.0
-            self._log_throttled("heartbeat", f"Nav2 lease lost; bridge disarmed: {exc}")
+            self._log_throttled("heartbeat_rejected", f"Nav2 lease rejected; bridge disarmed: {exc}")
+        except RuntimeError as exc:
+            self._log_throttled("heartbeat_retry", f"Nav2 heartbeat failed; retaining lease and retrying: {exc}")
 
         stale = False
         with self._lock:
@@ -464,7 +656,12 @@ class OmniBotBackendBridge(Node):
         dt = min(max(now - self._last_odom_at, 0.0), 0.1)
         self._last_odom_at = now
         with self._lock:
-            vx, vy, wz = self._vx, self._vy, self._wz
+            if self._claimed and self._armed:
+                vx, vy, wz = self._vx, self._vy, self._wz
+            elif time.monotonic() - self._manual_odom_received_at <= 0.5:
+                vx, vy, wz = self._manual_odom_vx, self._manual_odom_vy, self._manual_odom_wz
+            else:
+                vx = vy = wz = 0.0
             mid_yaw = self._yaw + 0.5 * wz * dt
             self._x += (vx * math.cos(mid_yaw) - vy * math.sin(mid_yaw)) * dt
             self._y += (vx * math.sin(mid_yaw) + vy * math.cos(mid_yaw)) * dt
@@ -528,4 +725,5 @@ def main(args: list[str] | None = None) -> None:
         rclpy.spin(node)
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()

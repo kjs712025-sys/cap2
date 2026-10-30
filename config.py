@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 
@@ -21,19 +22,42 @@ class RobotConfig:
     uart_baudrate: int = 115200
     uart_timeout: float = 0.5
 
-    camera_source: str = "usb"
+    @staticmethod
+    def default_camera_source() -> str:
+        """Prefer the Pi CSI camera on Raspberry Pi hosts unless overridden."""
+        configured = os.getenv("ROBOT_CAMERA_SOURCE")
+        if configured:
+            return configured.strip().lower()
+
+        model_path = Path("/sys/firmware/devicetree/base/model")
+        if model_path.exists():
+            try:
+                model = model_path.read_text(encoding="utf-8", errors="ignore").lower()
+            except OSError:
+                model = ""
+            if "raspberry pi" in model:
+                return "pi"
+
+        if os.path.exists("/dev/vchiq"):
+            return "pi"
+
+        return "usb"
+
+    camera_source: str = field(default_factory=lambda: RobotConfig.default_camera_source())
     camera_index: int = 0
     preview_enabled: bool = True
     fire_monitor_enabled: bool = True
     fire_monitor_interval: float = 2.0
     autostart_autonomous: bool = True
 
-    # Local YOLOv8 fire/smoke detector (see camera/vision.py). Two
+    # Local YOLOv8 fire/smoke detector (see camera/vision.py). The Firebot
+    # NCNN export is preferred on Raspberry Pi; the .pt model remains usable
+    # by overriding ROBOT_FIRE_MODEL_PATH. Two
     # confidence tiers: detections at/above warn are logged as a
     # non-blocking alert, detections at/above stop trigger a full
     # emergency stop. The gap between them absorbs false positives from
     # bright indoor lighting, which this model is prone to.
-    fire_model_path: str = "models/fire_detection/fire_yolov8s.pt"
+    fire_model_path: str = "models/fire_detection/fire_ncnn_model"
     fire_warn_confidence: float = 0.4
     fire_stop_confidence: float = 0.7
     # Halt autonomous navigation whenever a fire detection is published
@@ -130,7 +154,7 @@ class RobotConfig:
             uart_port=os.getenv("ROBOT_UART_PORT", defaults.uart_port),
             uart_baudrate=int(os.getenv("ROBOT_UART_BAUDRATE", defaults.uart_baudrate)),
             uart_timeout=float(os.getenv("ROBOT_UART_TIMEOUT", defaults.uart_timeout)),
-            camera_source=os.getenv("ROBOT_CAMERA_SOURCE", defaults.camera_source),
+            camera_source=os.getenv("ROBOT_CAMERA_SOURCE") or RobotConfig.default_camera_source(),
             camera_index=int(os.getenv("ROBOT_CAMERA_INDEX", defaults.camera_index)),
             preview_enabled=os.getenv("ROBOT_PREVIEW_ENABLED", "1") == "1",
             fire_monitor_enabled=os.getenv("ROBOT_FIRE_MONITOR_ENABLED", "1") == "1",

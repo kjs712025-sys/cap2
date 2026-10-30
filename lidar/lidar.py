@@ -19,6 +19,8 @@ PACKET_HEADER = b"\xaa\x55"
 DEFAULT_BAUDRATE = 128000
 SCAN_TIMEOUT_S = 0.5
 CONNECT_TIMEOUT_S = 1.0
+RECONNECT_BACKOFF_S = 3.0
+SCAN_CACHE_TTL_S = 0.2
 
 
 @dataclass(slots=True)
@@ -35,6 +37,7 @@ class LidarStatus:
 
     connected: bool = False
     last_scan: Optional[list[ScanPoint]] = None
+    last_scan_at: float = 0.0
     last_scan_hardware: bool = False
     last_error: Optional[str] = None
 
@@ -53,6 +56,7 @@ class LidarSensor:
         self.status = LidarStatus()
         self._scan_buffer: list[ScanPoint] = []
         self.serial: Optional[serial.Serial] = None
+        self._next_connect_attempt_at = 0.0
         # Serial reads aren't reentrant; the navigator loop and the REST
         # endpoints can both call read_scan() concurrently.
         self._read_lock = threading.Lock()
@@ -61,6 +65,8 @@ class LidarSensor:
         """Open the serial port and confirm a valid YDLiDAR packet is seen."""
         if self.serial and self.serial.is_open:
             self.status.connected = True
+            return
+        if time.monotonic() < self._next_connect_attempt_at:
             return
         try:
             self.serial = serial.Serial(
@@ -72,6 +78,7 @@ class LidarSensor:
             self.serial = None
             self.status.connected = False
             self.status.last_error = str(exc)
+            self._next_connect_attempt_at = time.monotonic() + RECONNECT_BACKOFF_S
             logger.warning("LiDAR unavailable: %s", exc)
             return
 
@@ -79,10 +86,12 @@ class LidarSensor:
             self.status.connected = True
             self.status.last_scan_hardware = False
             self.status.last_error = None
+            self._next_connect_attempt_at = 0.0
             logger.info("LiDAR connected on %s", self.config.lidar_port)
         else:
             self.status.connected = False
             self.status.last_error = "No valid YDLiDAR packet received"
+            self._next_connect_attempt_at = time.monotonic() + RECONNECT_BACKOFF_S
             if self.serial is not None:
                 try:
                     self.serial.close()
@@ -118,6 +127,7 @@ class LidarSensor:
             self.status.connected = True
             self.status.last_error = None
             self.status.last_scan = self._generate_virtual_scan()
+            self.status.last_scan_at = time.monotonic()
             logger.info("Using simulated LiDAR; no physical device will be opened")
             return True
         self.connect()
@@ -221,16 +231,25 @@ class LidarSensor:
             scan = self._generate_virtual_scan()
             self._scan_buffer = scan
             self.status.last_scan = scan
+            self.status.last_scan_at = time.monotonic()
             self.status.last_scan_hardware = False
             return scan
-        if not self.status.connected or not self.serial:
-            scan = self._generate_simulated_scan()
-            self._scan_buffer = scan
-            self.status.last_scan = scan
-            self.status.last_scan_hardware = False
-            return scan
-
         with self._read_lock:
+            if (
+                self.status.last_scan is not None
+                and self.status.last_scan_hardware
+                and time.monotonic() - self.status.last_scan_at <= SCAN_CACHE_TTL_S
+            ):
+                return self.status.last_scan
+            if not self.status.connected or not self.serial:
+                self.connect()
+            if not self.status.connected or not self.serial:
+                scan = self._generate_simulated_scan()
+                self._scan_buffer = scan
+                self.status.last_scan = scan
+                self.status.last_scan_at = time.monotonic()
+                self.status.last_scan_hardware = False
+                return scan
             return self._read_scan_locked()
 
     def _read_scan_locked(self) -> list[ScanPoint]:
@@ -273,6 +292,7 @@ class LidarSensor:
             self.status.connected = False
             self.status.last_scan_hardware = False
             self.status.last_error = str(exc)
+            self._next_connect_attempt_at = time.monotonic() + RECONNECT_BACKOFF_S
             if self.serial is not None:
                 try:
                     self.serial.close()
@@ -284,5 +304,6 @@ class LidarSensor:
         scan = points or self._generate_simulated_scan()
         self._scan_buffer = scan
         self.status.last_scan = scan
+        self.status.last_scan_at = time.monotonic()
         self.status.last_scan_hardware = completed_rotation and bool(points)
         return scan

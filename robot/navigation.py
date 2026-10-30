@@ -14,6 +14,7 @@ and back away when boxed in.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from typing import Any, Optional
 
@@ -34,6 +35,7 @@ logger = get_logger("robot.navigation")
 FRONT_CLEAR_M = 0.9    # path ahead is open — cruise
 FRONT_STOP_M = 0.4     # obstacle this close ahead — do not advance
 SIDE_PASS_M = 0.6      # a side/diagonal is passable above this
+LIDAR_SCAN_MAX_AGE_S = 1.5
 
 
 class AutonomousNavigator:
@@ -220,7 +222,7 @@ class AutonomousNavigator:
             return
         if time.monotonic() - self._camera_at < self.camera_interval:
             return
-        frame = self.camera.read_frame()
+        frame = await asyncio.to_thread(self.camera.read_frame)
         if frame is None:
             return
         try:
@@ -238,7 +240,29 @@ class AutonomousNavigator:
         proximity = self._proximity(sectors)
         blocked = self.status.mode is RobotMode.ERROR
 
-        if self.enabled and not blocked:
+        front = sectors["front"]["min_distance"]
+        scan_ready = (
+            bool(scan)
+            and front is not None
+            and math.isfinite(float(front))
+            and float(front) > 0.0
+            and (
+                self.config.simulation
+                or (
+                    self.lidar.status.last_scan_hardware
+                    and time.monotonic() - self.lidar.status.last_scan_at
+                    <= LIDAR_SCAN_MAX_AGE_S
+                )
+            )
+        )
+        if self.enabled and not blocked and not scan_ready:
+            self.disable()
+            command, decision, reason = (
+                VelocityCommand(0.0, 0.0, 0.0),
+                "blocked",
+                "Fresh forward LiDAR coverage unavailable; free roam stopped",
+            )
+        elif self.enabled and not blocked:
             command, decision, reason = self._decide(sectors)
             self._send(command)
             self._stopped_command_sent = False

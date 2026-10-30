@@ -496,6 +496,7 @@ let slamState = null;
 let slamEventSource = null;
 let slamRafRunning = false;
 let rosSlamMap = null;
+let selectedNav2Goal = null;
 
 function decodeSlamGrid(b64, cellCount) {
   const bin = atob(b64);
@@ -639,17 +640,126 @@ function hexToRgb(hex) {
   return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : null;
 }
 
+const LIDAR_DISPLAY_RANGE_M = 6;
+let lidarScanRequestActive = false;
+
+function drawLidarScan(scan, ready) {
+  const canvas = $('lidar-scan-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const size = canvas.clientWidth || 420;
+  const pixelSize = Math.round(size * dpr);
+  if (canvas.width !== pixelSize || canvas.height !== pixelSize) {
+    canvas.width = canvas.height = pixelSize;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, size, size);
+
+  const cx = size / 2;
+  const cy = size / 2;
+  const radius = size / 2 - 27;
+  const toXY = (angleDeg, distanceM) => {
+    const angle = (angleDeg - 90) * Math.PI / 180;
+    const distance = Math.min(distanceM, LIDAR_DISPLAY_RANGE_M) / LIDAR_DISPLAY_RANGE_M * radius;
+    return [cx - distance * Math.cos(angle), cy + distance * Math.sin(angle)];
+  };
+
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(95,227,212,0.025)';
+  ctx.fill();
+  ctx.font = '10px "DM Mono", ui-monospace, monospace';
+  ctx.textAlign = 'left';
+  for (const distance of [1.5, 3, 4.5, LIDAR_DISPLAY_RANGE_M]) {
+    const ringRadius = distance / LIDAR_DISPLAY_RANGE_M * radius;
+    ctx.beginPath();
+    ctx.arc(cx, cy, ringRadius, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(206,239,227,0.14)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(206,239,227,0.55)';
+    ctx.fillText(`${distance}m`, cx + 4, cy - ringRadius + 12);
+  }
+
+  ctx.strokeStyle = 'rgba(206,239,227,0.10)';
+  ctx.lineWidth = 1;
+  for (let angle = 0; angle < 360; angle += 45) {
+    const [x, y] = toXY(angle, LIDAR_DISPLAY_RANGE_M);
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#aebfba';
+  ctx.textAlign = 'center';
+  ctx.fillText('FRONT', cx, 13);
+  ctx.fillText('REAR', cx, size - 5);
+  ctx.fillText('LEFT', 14, cy + 3);
+  ctx.fillText('RIGHT', size - 17, cy + 3);
+
+  if (ready && Array.isArray(scan)) {
+    for (const point of scan) {
+      const angle = Number(point.angle_deg);
+      const distance = Number(point.distance_m);
+      if (!Number.isFinite(angle) || !Number.isFinite(distance) || distance <= 0 || distance > LIDAR_DISPLAY_RANGE_M) continue;
+      const [x, y] = toXY(angle, distance);
+      const near = distance <= 0.6;
+      const caution = distance <= 1.2;
+      ctx.beginPath();
+      ctx.arc(x, y, near ? 2.8 : 1.8, 0, Math.PI * 2);
+      ctx.fillStyle = near ? '#ff7a66' : caution ? '#ffce6a' : '#5fe3d4';
+      ctx.fill();
+    }
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.fillStyle = '#cdfb6e';
+    ctx.beginPath();
+    ctx.moveTo(0, -9);
+    ctx.lineTo(6, 6);
+    ctx.lineTo(0, 3);
+    ctx.lineTo(-6, 6);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  } else {
+    ctx.fillStyle = '#ffce6a';
+    ctx.font = '12px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('LiDAR scan unavailable', cx, cy + radius * 0.55);
+  }
+}
+
 async function scanLidar() {
-  $('lidar-obstacles').textContent = 'scanning...';
+  if (lidarScanRequestActive) return;
+  lidarScanRequestActive = true;
+  $('lidar-scan-state').textContent = 'scanning…';
+  $('lidar-scan-error').textContent = '';
   try {
     const response = await fetch('/lidar/scan');
     const payload = await response.json();
     if (!response.ok || !payload.success) throw new Error(payload.message || 'Scan failed');
-    $('lidar-proximity').textContent = `${payload.data?.proximity ?? '--'} m`;
-    $('lidar-safe-direction').textContent = payload.data?.safe_direction || '--';
-    $('lidar-obstacles').textContent = (payload.data?.obstacles || []).length;
+    const data = payload.data || {};
+    const scan = Array.isArray(data.scan) ? data.scan : [];
+    const obstacles = Array.isArray(data.obstacles) ? data.obstacles : [];
+    drawLidarScan(scan, !!data.ready);
+    $('lidar-proximity').textContent = data.proximity == null ? '--' : `${Number(data.proximity).toFixed(2)} m`;
+    $('lidar-safe-direction').textContent = data.safe_direction || '--';
+    $('lidar-obstacles').textContent = String(obstacles.length);
+    $('lidar-scan-state').textContent = data.ready ? 'LIVE' : 'OFFLINE';
+    $('lidar-scan-caption').textContent = data.ready
+      ? `front ↑ · range ${LIDAR_DISPLAY_RANGE_M} m · ${scan.length} points · ${new Date().toLocaleTimeString()}`
+      : 'front ↑ · scan unavailable · check LiDAR connection';
+    if (!data.ready) $('lidar-scan-error').textContent = 'No valid physical LiDAR scan is currently available.';
   } catch (error) {
     $('lidar-obstacles').textContent = 'failed';
+    $('lidar-scan-state').textContent = 'ERROR';
+    $('lidar-scan-caption').textContent = 'front ↑ · scan unavailable';
+    $('lidar-scan-error').textContent = `LiDAR scan failed: ${error.message}`;
+    drawLidarScan([], false);
+  } finally {
+    lidarScanRequestActive = false;
   }
 }
 
@@ -1120,23 +1230,46 @@ function showNav2Message(message, isError = false) {
   el.classList.toggle('success', !isError);
 }
 
+let nav2SpeedUpdatePending = false;
+
 async function pollNav2State() {
   try {
     const state = await nav2Request('/nav2/state');
+    const speedSlider = $('nav2-speed');
+    if (!nav2SpeedUpdatePending && document.activeElement !== speedSlider) {
+      speedSlider.value = Number(state.max_linear_speed_mps).toFixed(2);
+      $('nav2-speed-value').textContent = `${Number(state.max_linear_speed_mps).toFixed(2)} m/s`;
+    }
     const control = await nav2Request('/mode');
     applyControlMode(control.mode);
     const badge = $('nav2-stack-state');
     badge.textContent = state.running ? `running · PID ${state.pid}` : 'not running';
     badge.classList.toggle('online', !!state.running);
     badge.classList.toggle('offline', !state.running);
-    $('nav2-start-btn').disabled = !!state.running;
     $('nav2-stop-btn').disabled = !state.running;
-    $('mode-auto-btn').disabled = !state.running && !state.control_claimed;
-    $('nav2-arm-btn').disabled = !state.running || !!state.armed || !state.lidar_ready || !state.stm32_connected
-      || (!state.simulation && (!state.slam_running || !state.ros_map_ready));
+    const missionStartButton = $('nav2-mission-start-btn');
+    const mission = state.mission_start || {};
+    missionStartButton.disabled = !!mission.active || !!state.control_claimed || !!state.armed;
     $('nav2-release-btn').disabled = !state.control_claimed;
-    $('nav2-goal-btn').disabled = !state.running || !state.control_claimed || !state.armed;
+    $('nav2-goal-btn').disabled = !state.running || !state.control_claimed || !state.armed
+      || (!state.simulation && (!state.slam_running || !state.ros_map_ready));
     $('nav2-cancel-btn').disabled = !state.control_claimed;
+    const patrol = state.patrol || {};
+    const recording = !!patrol.recording;
+    const patrolling = !!patrol.patrolling;
+    $('nav2-roam-start-btn').disabled = !!mission.active || !!state.roam_enabled || !!state.control_claimed
+      || (state.simulation !== true && (!state.stm32_connected || !state.lidar_ready));
+    $('nav2-roam-stop-btn').disabled = !state.roam_enabled;
+    $('nav2-patrol-record-start-btn').disabled = !!mission.active || recording || patrolling || !!state.roam_enabled
+      || !!state.control_claimed || !state.slam_running || !state.map_pose
+      || (state.simulation !== true && (!state.stm32_connected || !state.lidar_ready));
+    $('nav2-patrol-record-stop-btn').disabled = !recording;
+    $('nav2-patrol-start-btn').disabled = !!mission.active || recording || patrolling || !!state.roam_enabled
+      || Number(patrol.waypoint_count || 0) < 2;
+    $('nav2-patrol-stop-btn').disabled = !patrolling;
+    $('nav2-patrol-message').textContent = patrol.message
+      ? `${patrol.message}${recording ? ` · ${patrol.point_count}점 기록` : ''}${patrol.waypoint_count ? ` · ${patrol.waypoint_count}개 지점` : ''}`
+      : '저장 경로 없음 · SLAM 지도를 켜고 수동 경로를 기록하세요.';
     const slamBadge = $('ros-slam-state');
     slamBadge.textContent = state.slam_running ? 'running' : 'stopped';
     slamBadge.classList.toggle('online', !!state.slam_running);
@@ -1151,21 +1284,92 @@ async function pollNav2State() {
     } else {
       $('ros-slam-message').textContent = 'SLAM Toolbox is stopped. Start it to receive and display the ROS map.';
     }
-    if (!state.running && !state.workspace_built) {
+    const missionStages = {
+      starting_nav2: 'Nav2 스택 시작 중…',
+      starting_slam: 'SLAM Toolbox 시작 중…',
+      waiting_for_map: 'Nav2 활성화와 최신 ROS 지도·실제 LiDAR 스캔을 기다리는 중…',
+      claiming_control: 'Nav2 제어권 확보 중…',
+      arming_motors: '안전 상태 확인 후 모터 무장 중…',
+      sending_goal: '목표 전송 중…',
+    };
+    if (mission.active) {
+      const readinessLabels = {
+        nav2: 'Nav2 프로세스',
+        slam: 'SLAM',
+        action_server: 'Nav2 활성 액션 서버',
+        map: '최신 ROS 지도',
+        lidar: '최신 실제 LiDAR 스캔',
+      };
+      const readiness = mission.readiness || {
+        nav2: state.running,
+        slam: state.slam_running,
+        action_server: state.nav2_action_ready,
+        map: state.ros_map_ready,
+        lidar: state.lidar_ready,
+      };
+      const waitingFor = Object.entries(readiness)
+        .filter(([, ready]) => !ready)
+        .map(([check]) => readinessLabels[check] || check);
+      const stageMessage = missionStages[mission.stage] || '자율주행 준비 중…';
+      showNav2Message(
+        mission.stage === 'waiting_for_map' && waitingFor.length
+          ? `${stageMessage} 대기 항목: ${waitingFor.join(', ')}`
+          : stageMessage
+      );
+    } else if (
+      mission.stage === 'failed' &&
+      mission.message &&
+      !(
+          mission.message === 'Nav2 or SLAM stopped during startup' &&
+          state.running &&
+          state.slam_running &&
+          state.nav2_action_ready &&
+          state.ros_map_ready &&
+          state.lidar_ready &&
+          (state.simulation || state.stm32_connected)
+      )
+    ) {
+      showNav2Message(mission.message, true);
+    } else if (!state.running && !state.workspace_built) {
       showNav2Message('Nav2 workspace not built. Build ros2_ws before starting.', true);
     } else if (!state.running && state.last_exit_code != null && state.last_exit_code !== 0) {
       showNav2Message(`Nav2 exited (${state.last_exit_code}); see logs/nav2.log.`, true);
+    } else if (state.goal) {
+      showNav2Message(`Nav2 목표 등록 · x=${state.goal.x.toFixed(2)} m, y=${state.goal.y.toFixed(2)} m. 주변을 계속 감독하세요.`);
+    } else if (mission.stage === 'ready_for_goal') {
+      showNav2Message(mission.message || '지도에서 목표 좌표를 지정해 Nav2로 전송하세요.');
     } else if (state.armed) {
-      showNav2Message('Nav2 controls the robot. Open-loop odometry can drift; supervise continuously.');
+      showNav2Message('자율주행 중입니다. 로봇을 계속 감독하세요. 제어 해제·정지 버튼으로 즉시 멈출 수 있습니다.');
     } else if (state.control_claimed) {
-      showNav2Message(state.lidar_ready ? 'Control reserved; motors disarmed.' : 'Waiting for a fresh physical LiDAR scan.');
+      showNav2Message('Nav2 제어권이 예약되었습니다. 모터는 해제 상태입니다.');
+    } else if (mission.stage === 'active') {
+      showNav2Message('목표를 전송했습니다. 주변을 계속 감독하세요.');
     } else if (state.running) {
-      showNav2Message('Nav2 is running. Verify scan/map and clear the robot area before claiming control.');
+      showNav2Message('스택이 준비되었습니다. 자율주행을 시작하고 지도 좌표로 Nav2 목표를 지정하세요.');
     } else {
-      showNav2Message('Nav2 is stopped. Starting the stack does not move or arm the robot.');
+      showNav2Message('자율주행 시작 후 Nav2·SLAM 준비가 완료되면 지도 좌표로 목표를 지정하세요.');
     }
   } catch (error) {
     showNav2Message(`Nav2 status unavailable: ${error.message}`, true);
+  }
+}
+
+async function updateNav2Speed() {
+  const speed = Number($('nav2-speed').value);
+  $('nav2-speed-value').textContent = `${speed.toFixed(2)} m/s`;
+  nav2SpeedUpdatePending = true;
+  try {
+    const result = await nav2Request('/nav2/speed', {
+      method: 'POST',
+      body: JSON.stringify({ max_linear_speed_mps: speed }),
+    });
+    $('nav2-speed').value = Number(result.max_linear_speed_mps).toFixed(2);
+    $('nav2-speed-value').textContent = `${Number(result.max_linear_speed_mps).toFixed(2)} m/s`;
+    showNav2Message(`자율주행 최대 이동 속도를 ${Number(result.max_linear_speed_mps).toFixed(2)} m/s로 설정했습니다.`);
+  } catch (error) {
+    showNav2Message(`속도 설정 실패: ${error.message}`, true);
+  } finally {
+    nav2SpeedUpdatePending = false;
   }
 }
 
@@ -1195,28 +1399,130 @@ function drawRosSlamMap(map) {
   const cells = map.__cells || decodeSlamGrid(map.grid_b64, size);
   map.__cells = cells;
   const image = ctx.createImageData(map.width, map.height);
+  let minX = map.width;
+  let minY = map.height;
+  let maxX = -1;
+  let maxY = -1;
   for (let row = 0; row < map.height; row += 1) {
     for (let column = 0; column < map.width; column += 1) {
       const source = row * map.width + column;
       const value = cells[source] > 127 ? cells[source] - 256 : cells[source];
       const dest = ((map.height - 1 - row) * map.width + column) * 4;
       if (value < 0) {
-        image.data[dest] = 45; image.data[dest + 1] = 57; image.data[dest + 2] = 59; image.data[dest + 3] = 255;
+        image.data[dest] = 12; image.data[dest + 1] = 18; image.data[dest + 2] = 19; image.data[dest + 3] = 255;
       } else {
+        minX = Math.min(minX, column);
+        minY = Math.min(minY, row);
+        maxX = Math.max(maxX, column);
+        maxY = Math.max(maxY, row);
         const shade = Math.round(235 - value * 1.8);
         image.data[dest] = shade; image.data[dest + 1] = shade; image.data[dest + 2] = shade; image.data[dest + 3] = 255;
       }
     }
   }
+  if (maxX < minX || maxY < minY) {
+    ctx.fillStyle = '#78908a';
+    ctx.font = '13px system-ui, sans-serif';
+    ctx.fillText('waiting for known map cells…', 16, 24);
+    return;
+  }
+
+  const paddingX = Math.ceil((maxX - minX + 1) * 0.12);
+  const paddingY = Math.ceil((maxY - minY + 1) * 0.12);
+  const cropLeft = Math.max(0, minX - paddingX);
+  const cropRight = Math.min(map.width - 1, maxX + paddingX);
+  const cropBottom = Math.max(0, minY - paddingY);
+  const cropTop = Math.min(map.height - 1, maxY + paddingY);
+  const cropWidth = cropRight - cropLeft + 1;
+  const cropHeight = cropTop - cropBottom + 1;
+  const sourceTop = map.height - 1 - cropTop;
   const offscreen = document.createElement('canvas');
   offscreen.width = map.width;
   offscreen.height = map.height;
   offscreen.getContext('2d').putImageData(image, 0, 0);
-  const scale = Math.min(cssWidth / map.width, cssHeight / map.height);
-  const drawWidth = map.width * scale;
-  const drawHeight = map.height * scale;
+  const scale = Math.min((cssWidth - 16) / cropWidth, (cssHeight - 16) / cropHeight);
+  const drawWidth = cropWidth * scale;
+  const drawHeight = cropHeight * scale;
+  const drawX = (cssWidth - drawWidth) / 2;
+  const drawY = (cssHeight - drawHeight) / 2;
+  map.__display = { cropLeft, cropTop, cropWidth, cropHeight, scale, drawX, drawY };
   ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(offscreen, (cssWidth - drawWidth) / 2, (cssHeight - drawHeight) / 2, drawWidth, drawHeight);
+  ctx.drawImage(
+    offscreen,
+    cropLeft, sourceTop, cropWidth, cropHeight,
+    drawX, drawY, drawWidth, drawHeight,
+  );
+  drawNav2GoalMarker(ctx, map, cells);
+}
+
+function drawNav2GoalMarker(ctx, map, cells) {
+  if (!selectedNav2Goal || !map.__display || !map.origin_m || !map.resolution_m) return;
+  const { cropLeft, cropTop, cropWidth, cropHeight, scale, drawX, drawY } = map.__display;
+  const dx = selectedNav2Goal.x - map.origin_m.x;
+  const dy = selectedNav2Goal.y - map.origin_m.y;
+  const yaw = map.origin_m.yaw || 0;
+  const localX = Math.cos(yaw) * dx + Math.sin(yaw) * dy;
+  const localY = -Math.sin(yaw) * dx + Math.cos(yaw) * dy;
+  const column = localX / map.resolution_m;
+  const row = localY / map.resolution_m;
+  if (column < cropLeft || column >= cropLeft + cropWidth
+    || row > cropTop || row <= cropTop - cropHeight) return;
+  const cellColumn = Math.floor(column);
+  const cellRow = Math.floor(row);
+  const value = cells[cellRow * map.width + cellColumn] > 127
+    ? cells[cellRow * map.width + cellColumn] - 256
+    : cells[cellRow * map.width + cellColumn];
+  if (value < 0 || value >= 65) return;
+  const x = drawX + (column - cropLeft) * scale;
+  const y = drawY + (cropTop - row) * scale;
+  ctx.strokeStyle = '#42e6a4';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(x, y, 7, 0, Math.PI * 2);
+  ctx.moveTo(x - 5, y);
+  ctx.lineTo(x + 5, y);
+  ctx.moveTo(x, y - 5);
+  ctx.lineTo(x, y + 5);
+  ctx.stroke();
+}
+
+function selectNav2GoalFromMap(event) {
+  const map = rosSlamMap;
+  if (!map?.__display || !map?.__cells || !map.origin_m || !Number.isFinite(map.resolution_m)) {
+    showNav2Message('유효한 ROS 지도가 준비된 뒤 목표 지점을 선택하세요.', true);
+    return;
+  }
+  const canvas = $('ros-slam-canvas');
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const { cropLeft, cropTop, cropWidth, cropHeight, scale, drawX, drawY } = map.__display;
+  const column = cropLeft + (x - drawX) / scale;
+  const row = cropTop - (y - drawY) / scale;
+  if (column < cropLeft || column >= cropLeft + cropWidth
+    || row > cropTop || row <= cropTop - cropHeight) {
+    showNav2Message('표시된 지도 영역 안의 목표 지점을 선택하세요.', true);
+    return;
+  }
+  const cellColumn = Math.floor(column);
+  const cellRow = Math.floor(row);
+  const rawValue = map.__cells[cellRow * map.width + cellColumn];
+  const occupancy = rawValue > 127 ? rawValue - 256 : rawValue;
+  if (occupancy < 0 || occupancy >= 65) {
+    showNav2Message('목표는 지도가 확인한 빈 공간에 지정하세요.', true);
+    return;
+  }
+  const localX = (cellColumn + 0.5) * map.resolution_m;
+  const localY = (cellRow + 0.5) * map.resolution_m;
+  const yaw = map.origin_m.yaw || 0;
+  selectedNav2Goal = {
+    x: map.origin_m.x + Math.cos(yaw) * localX - Math.sin(yaw) * localY,
+    y: map.origin_m.y + Math.sin(yaw) * localX + Math.cos(yaw) * localY,
+  };
+  $('nav2-goal-x').value = selectedNav2Goal.x.toFixed(2);
+  $('nav2-goal-y').value = selectedNav2Goal.y.toFixed(2);
+  drawRosSlamMap(map);
+  showNav2Message(`지도 목표 선택됨 · x=${selectedNav2Goal.x.toFixed(2)} m, y=${selectedNav2Goal.y.toFixed(2)} m. 도착 방향을 확인한 뒤 목표 전송을 누르세요.`);
 }
 
 async function pollRosSlamMap() {
@@ -1226,7 +1532,7 @@ async function pollRosSlamMap() {
     drawRosSlamMap(rosSlamMap);
     const age = result.age_seconds;
     $('ros-slam-map-caption').textContent = rosSlamMap
-      ? `${rosSlamMap.width} × ${rosSlamMap.height} cells · ${rosSlamMap.resolution_m.toFixed(2)} m/cell${age == null ? '' : ` · ${age.toFixed(1)} s ago`}`
+      ? `${rosSlamMap.width} × ${rosSlamMap.height} cells · ${rosSlamMap.resolution_m.toFixed(2)} m/cell · known-area zoom${age == null ? '' : ` · ${age.toFixed(1)} s ago`}`
       : 'ROS /map occupancy grid';
   } catch (error) {
     $('ros-slam-message').textContent = `ROS map unavailable: ${error.message}`;
@@ -1274,30 +1580,41 @@ async function saveRosSlamMap() {
   await pollNav2State();
 }
 
-async function startNav2Stack() {
-  $('nav2-start-btn').disabled = true;
-  showNav2Message('Starting ROS 2 Nav2 stack…');
+function readGoalInputs() {
+  const xValue = $('nav2-goal-x').value.trim();
+  const yValue = $('nav2-goal-y').value.trim();
+  const yawValue = $('nav2-goal-yaw').value.trim();
+  if (!xValue || !yValue || !yawValue) throw new Error('목표 X, Y, 방향 값을 모두 입력하세요.');
+  const goal = {
+    x: Number(xValue),
+    y: Number(yValue),
+    yaw: Number(yawValue) * Math.PI / 180,
+  };
+  if (!Number.isFinite(goal.x) || !Number.isFinite(goal.y) || !Number.isFinite(goal.yaw)) {
+    throw new Error('목표 좌표와 방향은 유효한 숫자여야 합니다.');
+  }
+  if (Math.max(Math.abs(goal.x), Math.abs(goal.y)) > 20) {
+    throw new Error('목표 좌표는 지도 원점에서 20 m 이내여야 합니다.');
+  }
+  return goal;
+}
+
+async function startAutonomousMission() {
+  const button = $('nav2-mission-start-btn');
+  button.disabled = true;
+  showNav2Message('Nav2·SLAM과 실제 LiDAR를 확인하고 목표 전송을 준비합니다. 모터는 목표를 보내기 전까지 이동하지 않습니다.');
   try {
-    const result = await nav2Request('/nav2/stack/start', { method: 'POST' });
-    showNav2Message(result.message || 'Nav2 launch started; motors remain disarmed.');
+    const result = await nav2Request('/nav2/mission/start', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    applyControlMode('autonomous');
+    showNav2Message(result.message || 'Nav2 준비가 완료됐습니다. 지도 좌표로 목표를 지정하세요.');
   } catch (error) {
     showNav2Message(error.message, true);
   } finally {
-    await pollNav2State();
+    await Promise.all([pollNav2State(), pollRosSlamMap()]);
   }
-}
-
-async function armNav2() {
-  if (!window.confirm('모터를 무장할까요? 바퀴를 띄우거나 로봇 주변을 비우고, 비상정지 수단을 준비했는지 확인하세요.')) return;
-  $('nav2-arm-btn').disabled = true;
-  try {
-    await nav2Request('/nav2/claim', { method: 'POST', body: '{}' });
-    await nav2Request('/nav2/arm', { method: 'POST', body: '{}' });
-    showNav2Message('STM32 armed. Nav2 goals can now move the robot.');
-  } catch (error) {
-    showNav2Message(error.message, true);
-  }
-  await pollNav2State();
 }
 
 async function releaseNav2() {
@@ -1325,21 +1642,7 @@ async function stopNav2Stack() {
 async function sendNav2Goal() {
   if (!window.confirm('입력한 지도 좌표로 Nav2 목표를 전송합니다. 로봇 주변과 정지 수단을 확인했습니까?')) return;
   try {
-    const xValue = $('nav2-goal-x').value.trim();
-    const yValue = $('nav2-goal-y').value.trim();
-    const yawValue = $('nav2-goal-yaw').value.trim();
-    if (!xValue || !yValue || !yawValue) throw new Error('목표 X, Y, 방향 값을 모두 입력하세요.');
-    const goal = {
-      x: Number(xValue),
-      y: Number(yValue),
-      yaw: Number(yawValue) * Math.PI / 180,
-    };
-    if (!Number.isFinite(goal.x) || !Number.isFinite(goal.y) || !Number.isFinite(goal.yaw)) {
-      throw new Error('목표 좌표와 방향은 유효한 숫자여야 합니다.');
-    }
-    if (Math.max(Math.abs(goal.x), Math.abs(goal.y)) > 20) {
-      throw new Error('목표 좌표는 지도 원점에서 20 m 이내여야 합니다.');
-    }
+    const goal = readGoalInputs();
     const result = await nav2Request('/nav2/goal', {
       method: 'POST',
       body: JSON.stringify(goal),
@@ -1358,6 +1661,75 @@ async function cancelNav2Goal() {
   } catch (error) {
     showNav2Message(error.message, true);
   }
+}
+
+async function startReactiveRoam() {
+  if (!window.confirm('LiDAR 반응형 주변 탐색을 시작합니다. 주변과 정지 수단을 확인했습니까?')) return;
+  try {
+    await nav2Request('/navigation/roam/start', { method: 'POST', body: '{}' });
+    showNav2Message('LiDAR 주변 탐색을 시작했습니다. 이동 중 계속 감독하세요.');
+  } catch (error) {
+    showNav2Message(error.message, true);
+  }
+  await pollNav2State();
+}
+
+async function stopReactiveRoam() {
+  try {
+    await nav2Request('/navigation/roam/stop', { method: 'POST', body: '{}' });
+    showNav2Message('주변 탐색을 중지하고 모터를 해제했습니다.');
+  } catch (error) {
+    showNav2Message(error.message, true);
+  }
+  await pollNav2State();
+}
+
+async function startPatrolRecording() {
+  if (!window.confirm('경로 기록을 시작합니다. SLAM 지도 위치가 표시되는지 확인하고 수동 조작으로 경로를 운전하세요.')) return;
+  try {
+    const result = await nav2Request('/nav2/patrol/record/start', { method: 'POST', body: '{}' });
+    $('nav2-patrol-message').textContent = result.message || '경로 기록 중입니다. 수동으로 경로를 운전하세요.';
+  } catch (error) {
+    $('nav2-patrol-message').textContent = error.message;
+  }
+  await pollNav2State();
+}
+
+async function stopPatrolRecording() {
+  try {
+    const result = await nav2Request('/nav2/patrol/record/stop', { method: 'POST', body: '{}' });
+    $('nav2-patrol-message').textContent = result.message || '경로를 저장했습니다.';
+  } catch (error) {
+    $('nav2-patrol-message').textContent = error.message;
+  }
+  await pollNav2State();
+}
+
+async function startRoutePatrol() {
+  if (!window.confirm('저장된 경로를 Nav2로 순찰합니다. 반복 순찰 여부를 확인하고 로봇 주변을 비워 두었습니까?')) return;
+  const button = $('nav2-patrol-start-btn');
+  button.disabled = true;
+  $('nav2-patrol-message').textContent = 'Nav2·SLAM 준비 후 경로 순찰을 시작합니다…';
+  try {
+    const result = await nav2Request('/nav2/patrol/start', {
+      method: 'POST',
+      body: JSON.stringify({ repeat: $('nav2-patrol-repeat').checked }),
+    });
+    $('nav2-patrol-message').textContent = result.patrol?.message || '경로 순찰을 시작했습니다.';
+  } catch (error) {
+    $('nav2-patrol-message').textContent = error.message;
+  }
+  await pollNav2State();
+}
+
+async function stopRoutePatrol() {
+  try {
+    const result = await nav2Request('/nav2/patrol/stop', { method: 'POST', body: '{}' });
+    $('nav2-patrol-message').textContent = result.message || '경로 순찰을 중지했습니다.';
+  } catch (error) {
+    $('nav2-patrol-message').textContent = error.message;
+  }
+  await pollNav2State();
 }
 
 // --- Control mode: 'manual' | 'autonomous' -------------------------------
@@ -1518,13 +1890,22 @@ $('camera-analyze-btn').addEventListener('click', analyzeCamera);
 
 $('lidar-refresh-btn').addEventListener('click', scanLidar);
 $('mode-manual-btn').addEventListener('click', () => setControlMode('manual'));
-$('mode-auto-btn').addEventListener('click', () => setControlMode('auto'));
-$('nav2-start-btn').addEventListener('click', startNav2Stack);
-$('nav2-arm-btn').addEventListener('click', armNav2);
+$('nav2-mission-start-btn').addEventListener('click', startAutonomousMission);
+$('nav2-speed').addEventListener('input', () => {
+  $('nav2-speed-value').textContent = `${Number($('nav2-speed').value).toFixed(2)} m/s`;
+});
+$('nav2-speed').addEventListener('change', updateNav2Speed);
+$('ros-slam-canvas').addEventListener('click', selectNav2GoalFromMap);
 $('nav2-release-btn').addEventListener('click', releaseNav2);
 $('nav2-stop-btn').addEventListener('click', stopNav2Stack);
 $('nav2-goal-btn').addEventListener('click', sendNav2Goal);
 $('nav2-cancel-btn').addEventListener('click', cancelNav2Goal);
+$('nav2-roam-start-btn').addEventListener('click', startReactiveRoam);
+$('nav2-roam-stop-btn').addEventListener('click', stopReactiveRoam);
+$('nav2-patrol-record-start-btn').addEventListener('click', startPatrolRecording);
+$('nav2-patrol-record-stop-btn').addEventListener('click', stopPatrolRecording);
+$('nav2-patrol-start-btn').addEventListener('click', startRoutePatrol);
+$('nav2-patrol-stop-btn').addEventListener('click', stopRoutePatrol);
 $('ros-slam-start-btn').addEventListener('click', startRosSlam);
 $('ros-slam-stop-btn').addEventListener('click', stopRosSlam);
 $('ros-slam-save-btn').addEventListener('click', saveRosSlamMap);
@@ -1534,6 +1915,9 @@ applyControlMode('manual');
 
 connectWebSocket();
 refreshAll();
+drawLidarScan([], false);
+scanLidar();
+setInterval(scanLidar, 1000);
 refreshCameraFeed();
 startSlamLoop();
 startSlamStream();

@@ -66,7 +66,7 @@ def generate_launch_description():
                     {
                         "backend_url": backend_url,
                         "api_token": api_token,
-                        "scan_poll_period": 0.05,
+                        "scan_poll_period": 0.25,
                         "lidar_x": 0.0,
                         "lidar_y": 0.0,
                         "lidar_z": 0.16,

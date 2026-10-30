@@ -25,12 +25,12 @@ already the value in the backend `.env` (`ROBOT_UART_PORT`).
 |---|---|---|---|---|
 | M0 FL | D3 | D4 | D5 | #1 ch 1 |
 | M1 FR | D6 | D7 | D8 | #1 ch 2 |
-| M2 RL | D9 | D10 | D11 | #2 ch 1 |
-| M3 RR | D12 | D13 | D2 | #2 ch 2 |
+| M2 RL | A0 | A1 | A2 | #2 ch 1 |
+| M3 RR | A3 | A4 | A5 | #2 ch 2 |
 
 Common ground between the Nucleo, both drivers and the motor battery. Do **not**
-power the motors from the Nucleo. `D13` is also the on-board LED, so `LD2`
-blinks with M3's direction bit.
+power the motors from the Nucleo. The table must match `PWM_PIN`, `DIR_PIN`,
+and `EN_PIN` in the firmware sketch.
 
 ## Calibrate (wheels off the ground)
 

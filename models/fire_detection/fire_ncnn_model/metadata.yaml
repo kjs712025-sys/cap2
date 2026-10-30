@@ -1,0 +1,21 @@
+description: Ultralytics fire model trained on /content/FASDD_CV/data.yaml
+author: Ultralytics
+date: '2026-10-02T08:54:03.584574+00:00'
+version: 8.4.170
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+head: Detect
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: fire
+  1: smoke
+args:
+  batch: 1
+  quantize: 16
+channels: 3
+end2end: false

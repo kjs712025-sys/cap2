@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -16,6 +17,8 @@ logger = get_logger("camera")
 
 PI_CAMERA_SIZE = (1280, 720)
 PI_CAMERA_FPS = 60
+CAMERA_RETRY_DELAY_S = 5.0
+CAMERA_FRAME_TIMEOUT_S = 2.0
 
 
 @dataclass(slots=True)
@@ -39,7 +42,9 @@ class Camera:
         self.config = config
         self.capture: Optional[cv2.VideoCapture] = None
         self._picam2: Optional[Any] = None
+        self._pi_capture_job: Optional[Any] = None
         self._is_running = False
+        self._next_open_attempt_at = 0.0
 
     def _open_pi_camera(self) -> None:
         """Open the CSI camera via picamera2."""
@@ -73,10 +78,17 @@ class Camera:
             logger.info("Using simulated camera; no physical device will be opened")
             return
 
+        now = time.monotonic()
+        if now < self._next_open_attempt_at:
+            return
+        self._next_open_attempt_at = now + CAMERA_RETRY_DELAY_S
+
         if self.config.camera_source == "pi":
             if self._picam2 is not None:
                 return
             self._open_pi_camera()
+            if self._picam2 is not None:
+                self._next_open_attempt_at = 0.0
             return
 
         if self.capture and self.capture.isOpened():
@@ -90,11 +102,13 @@ class Camera:
             return
 
         if not self.capture.isOpened():
+            self.capture.release()
             self.capture = None
             logger.warning("Unable to open camera from source %s", self.config.camera_source)
             return
 
         self._is_running = True
+        self._next_open_attempt_at = 0.0
         logger.info("Camera opened from source %s", self.config.camera_source)
 
     def is_ready(self) -> bool:
@@ -102,11 +116,7 @@ class Camera:
         if self.config.simulation:
             return True
         if self.config.camera_source == "pi":
-            if self._picam2 is None:
-                self.open()
             return self._picam2 is not None
-        if self.capture is None:
-            self.open()
         return self.capture is not None and self.capture.isOpened()
 
     def initialize(self) -> bool:
@@ -122,6 +132,7 @@ class Camera:
             except RuntimeError:
                 logger.warning("Pi camera stop failed")
             self._picam2 = None
+        self._pi_capture_job = None
         if self.capture is not None:
             self.capture.release()
             self.capture = None
@@ -158,10 +169,18 @@ class Camera:
                     self.open()
                 if self._picam2 is None:
                     return None
-                image = self._picam2.capture_array()
+                if self._pi_capture_job is None:
+                    self._pi_capture_job = self._picam2.capture_array(wait=False)
+                    return None
+                try:
+                    image = self._pi_capture_job.get_result(timeout=0)
+                except TimeoutError:
+                    return None
+                self._pi_capture_job = None
                 return CameraFrame(image=image, timestamp=cv2.getTickCount())
-            except RuntimeError as exc:
+            except (RuntimeError, TimeoutError) as exc:
                 logger.warning("Pi camera read failed: %s", exc)
+                self._pi_capture_job = None
                 return None
 
         try:
@@ -179,7 +198,12 @@ class Camera:
 
     def capture_image(self, output_path: str | Path) -> None:
         """Capture an image and save it to disk."""
-        frame = self.read_frame()
+        deadline = time.monotonic() + CAMERA_FRAME_TIMEOUT_S
+        frame = None
+        while frame is None and time.monotonic() < deadline:
+            frame = self.read_frame()
+            if frame is None:
+                time.sleep(0.02)
         if frame is None:
             raise RuntimeError("Unable to capture frame")
         path = Path(output_path)

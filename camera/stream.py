@@ -56,17 +56,26 @@ class CameraStream:
         """Yield encoded JPEG frames asynchronously, falling back to placeholders when needed."""
         frames_emitted = 0
         while True:
-            frame = self.camera.read_frame()
+            frame = await asyncio.to_thread(self.camera.read_frame)
             if frame is None:
                 placeholder = np.zeros((240, 320, 3), dtype=np.uint8)
                 cv2.putText(
                     placeholder,
-                    "no frame",
-                    (20, 120),
+                    "NO CAMERA FRAME",
+                    (20, 105),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0,
+                    0.7,
                     (255, 255, 255),
                     2,
+                )
+                cv2.putText(
+                    placeholder,
+                    "check CSI cable / sensor",
+                    (20, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (180, 180, 180),
+                    1,
                 )
                 _, payload = cv2.imencode(".jpg", placeholder)
                 if payload is None:
@@ -75,7 +84,7 @@ class CameraStream:
                 yield payload.tobytes()
                 if max_frames is not None and frames_emitted >= max_frames:
                     break
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.1)
                 continue
 
             image = frame.image

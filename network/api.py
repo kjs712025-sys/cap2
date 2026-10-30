@@ -24,6 +24,50 @@ from utils.logger import get_logger
 logger = get_logger("network.api")
 
 router = APIRouter()
+NAV2_MISSION_MAP_TIMEOUT_S = 90.0
+NAV2_MISSION_POLL_INTERVAL_S = 0.25
+NAV2_ACTION_READY_MAX_AGE_S = 2.0
+NAV2_SCAN_MAX_AGE_S = 1.5
+NAV2_MAP_POSE_MAX_AGE_S = 1.0
+
+
+def _nav2_action_is_ready(state: Any) -> bool:
+    return state.config.simulation or (
+        state.nav2_action_ready
+        and time.monotonic() - state.nav2_action_ready_at <= NAV2_ACTION_READY_MAX_AGE_S
+    )
+
+
+def _fresh_physical_scan(state: Any) -> bool:
+    lidar_status = state.lidar.status
+    return (
+        state.lidar.is_ready()
+        and lidar_status.last_scan_hardware
+        and lidar_status.last_scan is not None
+        and time.monotonic() - lidar_status.last_scan_at <= NAV2_SCAN_MAX_AGE_S
+    )
+
+
+def _fresh_ros_map_pose(state: Any) -> bool:
+    process = state.nav2_process.state()
+    return (
+        process.get("slam_running", False)
+        and state.ros_slam_map is not None
+        and time.time() - state.ros_slam_map_received_at <= 5.0
+        and state.nav2_map_pose is not None
+        and time.monotonic() - state.nav2_map_pose_at <= NAV2_MAP_POSE_MAX_AGE_S
+    )
+
+
+def _queue_nav2_goal(state: Any, goal: dict[str, float]) -> int:
+    state.nav2_goal_sequence += 1
+    state.nav2_cancel_sequence += 1
+    state.nav2_goal = {
+        "x": goal["x"],
+        "y": goal["y"],
+        "yaw": math.atan2(math.sin(goal["yaw"]), math.cos(goal["yaw"])),
+    }
+    return state.nav2_goal_sequence
 
 
 @router.get("/slam/status")
@@ -306,6 +350,8 @@ async def motion_command(request: Request) -> dict[str, Any]:
         return error("STM32 did not accept the manual motion command", code="stm32_unavailable")
 
     status.update_speed(vx, vy, wz)
+    request.app.state.manual_odom_command = {"vx": vx, "vy": vy, "wz": wz}
+    request.app.state.manual_odom_command_at = time.monotonic()
 
     return success({"command": {"vx": vx, "vy": vy, "wz": wz}}, message="motion_command")
 
@@ -364,7 +410,7 @@ async def camera_capture(request: Request) -> dict[str, Any]:
     camera = request.app.state.camera
     output_path = "captures/latest.jpg"
     try:
-        camera.capture_image(output_path)
+        await asyncio.to_thread(camera.capture_image, output_path)
     except RuntimeError as exc:
         return error(str(exc), code="camera_unavailable")
     return success({"path": output_path}, message="camera_capture")
@@ -373,7 +419,7 @@ async def camera_capture(request: Request) -> dict[str, Any]:
 @router.post("/camera/analyze")
 async def camera_analyze(request: Request) -> dict[str, Any]:
     """Capture a frame and analyze it with the configured vision LLM."""
-    frame = request.app.state.camera.read_frame()
+    frame = await asyncio.to_thread(request.app.state.camera.read_frame)
     if frame is None:
         return success({"summary": "Camera frame unavailable", "detections": []}, message="camera_analyze")
     analysis = await request.app.state.vision.analyze(frame.image)
@@ -492,6 +538,8 @@ def _claim_nav2_control(request: Request) -> dict[str, Any] | None:
     manual = getattr(state, "manual", None)
     if manual is not None:
         manual.stop()
+    state.manual_odom_command = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+    state.manual_odom_command_at = 0.0
     if not state.stm32.disarm():
         return error(
             "STM32 stop/disarm command could not be confirmed; Nav2 control was not claimed",
@@ -518,6 +566,11 @@ def _release_nav2_control(request: Request) -> bool:
         return False
     state.nav2_control_active = False
     state.nav2_last_command_at = 0.0
+    if hasattr(state, "nav2_patrol"):
+        state.nav2_patrol.stop()
+        state.nav2_patrol_active_goal_sequence = 0
+    state.manual_odom_command = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+    state.manual_odom_command_at = 0.0
     return True
 
 
@@ -565,6 +618,19 @@ async def nav2_heartbeat(request: Request) -> dict[str, Any]:
     state = request.app.state
     if not getattr(state, "nav2_control_active", False):
         return error("claim Nav2 control before sending a heartbeat", code="nav2_not_claimed")
+    if state.stm32.status.armed and not _nav2_action_is_ready(state):
+        disarmed = _release_nav2_control(request)
+        state.status.update_speed(0.0, 0.0, 0.0)
+        if state.status.mode is RobotMode.AUTONOMOUS:
+            state.status.set_mode(RobotMode.MANUAL)
+            state.status.mission = "ready"
+            state.status.ai_state = "standby"
+        message = (
+            "Nav2 action server became unavailable; control released and motors disarmed"
+            if disarmed
+            else "Nav2 action server became unavailable; STM32 disarm could not be confirmed"
+        )
+        return error(message, code="nav2_not_ready")
     if (
         state.stm32.status.armed
         and not state.config.simulation
@@ -592,25 +658,64 @@ async def nav2_heartbeat(request: Request) -> dict[str, Any]:
     return success({"claimed": True}, message="nav2_heartbeat")
 
 
+@router.post("/nav2/bridge/status")
+async def nav2_bridge_status(request: Request) -> dict[str, Any]:
+    """Record whether Nav2's NavigateToPose lifecycle action is active."""
+    try:
+        payload = await request.json()
+    except ValueError:
+        return error("bridge status must be a JSON object", code="bad_bridge_status")
+    if not isinstance(payload, dict) or not isinstance(payload.get("nav2_action_ready"), bool):
+        return error("nav2_action_ready must be a boolean", code="bad_bridge_status")
+    state = request.app.state
+    state.nav2_action_ready = payload["nav2_action_ready"]
+    state.nav2_action_ready_at = time.monotonic()
+    return success(
+        {"nav2_action_ready": state.nav2_action_ready},
+        message="nav2_bridge_status",
+    )
+
+
 @router.get("/nav2/state")
 async def nav2_state(request: Request) -> dict[str, Any]:
     state = request.app.state
     process = state.nav2_process.state()
+    if state.nav2_patrol.state()["recording"] and (
+        state.nav2_control_active
+        or state.navigator.enabled
+        or not _fresh_ros_map_pose(state)
+    ):
+        state.nav2_patrol.stop()
     return success(
         {
             **process,
             "control_claimed": bool(state.nav2_control_active),
             "armed": bool(state.stm32.status.armed),
+            "nav2_action_ready": _nav2_action_is_ready(state),
+            "roam_enabled": bool(state.navigator.enabled),
+            "patrol": state.nav2_patrol.state(),
+            "map_pose": state.nav2_map_pose if _fresh_ros_map_pose(state) else None,
+            "map_pose_age_seconds": (
+                max(0.0, time.monotonic() - state.nav2_map_pose_at)
+                if state.nav2_map_pose is not None
+                else None
+            ),
             "simulation": bool(state.config.simulation),
             "stm32_connected": bool(state.stm32.status.connected),
             "goal_sequence": state.nav2_goal_sequence,
             "goal": state.nav2_goal,
+            "max_linear_speed_mps": state.nav2_max_linear_speed_mps,
             "lidar_ready": state.lidar.is_ready() and (
                 state.config.simulation or state.lidar.status.last_scan_hardware
             ),
             "ros_map_ready": (
                 state.ros_slam_map is not None
                 and time.time() - state.ros_slam_map_received_at <= 5.0
+            ),
+            "mission_start": getattr(
+                state,
+                "nav2_mission_start",
+                {"active": False, "stage": "idle"},
             ),
             "ros_map_age_seconds": (
                 max(0.0, time.time() - state.ros_slam_map_received_at)
@@ -619,6 +724,237 @@ async def nav2_state(request: Request) -> dict[str, Any]:
             ),
         },
         message="nav2_state",
+    )
+
+
+@router.post("/nav2/bridge/pose")
+async def nav2_bridge_pose(request: Request) -> dict[str, Any]:
+    """Record the latest SLAM-corrected robot pose in the map frame."""
+    try:
+        payload = await request.json()
+    except ValueError:
+        return error("map pose must be a JSON object", code="bad_map_pose")
+    if not isinstance(payload, dict):
+        return error("map pose must be a JSON object", code="bad_map_pose")
+    try:
+        pose = {
+            "x": float(payload["x"]),
+            "y": float(payload["y"]),
+            "yaw": float(payload["yaw"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return error("map pose requires finite x, y, and yaw", code="bad_map_pose")
+    if not all(math.isfinite(value) for value in pose.values()):
+        return error("map pose requires finite x, y, and yaw", code="bad_map_pose")
+    if max(abs(pose["x"]), abs(pose["y"])) > 20.0:
+        return error("map pose is outside the supported 20 m map area", code="bad_map_pose")
+
+    state = request.app.state
+    pose["yaw"] = math.atan2(math.sin(pose["yaw"]), math.cos(pose["yaw"]))
+    state.nav2_map_pose = pose
+    state.nav2_map_pose_at = time.monotonic()
+    patrol = state.nav2_patrol
+    if patrol.state()["recording"]:
+        if state.nav2_control_active or state.navigator.enabled or _control_mode(request) != "manual":
+            patrol.stop()
+        else:
+            patrol.observe_pose(pose)
+    return success({"pose": pose}, message="nav2_map_pose")
+
+
+@router.post("/nav2/patrol/record/start")
+async def nav2_patrol_record_start(request: Request) -> dict[str, Any]:
+    state = request.app.state
+    if state.status.mode is RobotMode.ERROR or state.stm32.emergency_latched:
+        return error("emergency stop is latched — clear it first", code="emergency_latched")
+    if state.nav2_control_active or state.navigator.enabled:
+        return error("switch to manual mode before recording a patrol route", code="autonomous_active")
+    if not state.nav2_process.state()["slam_running"] or not _fresh_ros_map_pose(state):
+        return error("start SLAM and wait for a fresh map pose before recording", code="slam_pose_unavailable")
+    if not state.config.simulation and (
+        not state.stm32.status.connected or not _fresh_physical_scan(state)
+    ):
+        return error("connected STM32 and fresh physical LiDAR are required", code="hardware_unavailable")
+    try:
+        state.nav2_patrol.start_recording(state.nav2_map_pose)
+    except ValueError as exc:
+        return error(str(exc), code="patrol_state_invalid")
+    return success(state.nav2_patrol.state(), message="patrol_recording_started")
+
+
+@router.post("/nav2/patrol/record/stop")
+async def nav2_patrol_record_stop(request: Request) -> dict[str, Any]:
+    state = request.app.state
+    if not _fresh_ros_map_pose(state):
+        state.nav2_patrol.stop()
+        return error(
+            "fresh SLAM map pose unavailable; route recording was cancelled",
+            code="slam_pose_unavailable",
+        )
+    try:
+        result = state.nav2_patrol.stop_recording(state.nav2_map_pose)
+    except (OSError, ValueError) as exc:
+        return error(f"could not save patrol route: {exc}", code="patrol_save_failed")
+    return success(result, message="patrol_route_saved")
+
+
+@router.post("/nav2/patrol/start")
+async def nav2_patrol_start(request: Request) -> dict[str, Any]:
+    state = request.app.state
+    try:
+        payload = await request.json()
+    except ValueError:
+        return error("patrol options must be a JSON object", code="bad_patrol_options")
+    if not isinstance(payload, dict) or not isinstance(payload.get("repeat", True), bool):
+        return error("patrol repeat option must be a boolean", code="bad_patrol_options")
+    if state.status.mode is RobotMode.ERROR or state.stm32.emergency_latched:
+        return error("emergency stop is latched — clear it first", code="emergency_latched")
+    if state.navigator.enabled:
+        return error("stop free roam before starting a route patrol", code="reactive_navigation_active")
+    patrol_state = state.nav2_patrol.state()
+    if patrol_state["recording"]:
+        return error("stop route recording before starting patrol", code="patrol_recording")
+    if patrol_state["waypoint_count"] < 2:
+        return error("record and save a patrol route first", code="patrol_route_unavailable")
+
+    if not state.nav2_control_active:
+        mission_result = await nav2_mission_start(request)
+        if not mission_result.get("success"):
+            return mission_result
+    elif not state.stm32.status.armed:
+        arm_result = await nav2_arm(request)
+        if not arm_result.get("success"):
+            return arm_result
+
+    deadline = time.monotonic() + 10.0
+    while not _fresh_ros_map_pose(state) and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    if not _fresh_ros_map_pose(state):
+        disarmed = _release_nav2_control(request)
+        message = "A fresh SLAM-corrected map pose was unavailable; motors remain disarmed"
+        state.nav2_mission_start = {"active": False, "stage": "failed", "message": message}
+        return error(message if disarmed else f"{message}; STM32 disarm could not be confirmed",
+                     code="slam_pose_unavailable" if disarmed else "stm32_unavailable")
+
+    try:
+        first_goal = state.nav2_patrol.start(
+            state.nav2_map_pose,
+            repeat=payload.get("repeat", True),
+        )
+    except ValueError as exc:
+        disarmed = _release_nav2_control(request)
+        return error(
+            str(exc) if disarmed else f"{exc}; STM32 disarm could not be confirmed",
+            code="patrol_route_unavailable" if disarmed else "stm32_unavailable",
+        )
+
+    sequence = _queue_nav2_goal(state, first_goal)
+    state.nav2_patrol_active_goal_sequence = sequence
+    state.nav2_mission_start = {
+        "active": False,
+        "stage": "patrolling",
+        "message": state.nav2_patrol.state()["message"],
+    }
+    return success(
+        {"patrol": state.nav2_patrol.state(), "goal": state.nav2_goal},
+        message="patrol_started",
+    )
+
+
+@router.post("/nav2/patrol/stop")
+async def nav2_patrol_stop(request: Request) -> dict[str, Any]:
+    state = request.app.state
+    state.nav2_patrol.stop()
+    state.nav2_patrol_active_goal_sequence = 0
+    state.nav2_goal = None
+    state.nav2_cancel_sequence += 1
+    if state.nav2_control_active and not _release_nav2_control(request):
+        return error("patrol stopped but STM32 disarm could not be confirmed", code="stm32_unavailable")
+    state.nav2_mission_start = {
+        "active": False,
+        "stage": "patrol_stopped",
+        "message": state.nav2_patrol.state()["message"],
+    }
+    return success(state.nav2_patrol.state(), message="patrol_stopped")
+
+
+@router.post("/nav2/goal/result")
+async def nav2_goal_result(request: Request) -> dict[str, Any]:
+    state = request.app.state
+    try:
+        payload = await request.json()
+    except ValueError:
+        return error("goal result must be a JSON object", code="bad_goal_result")
+    if (
+        not isinstance(payload, dict)
+        or isinstance(payload.get("sequence"), bool)
+        or not isinstance(payload.get("sequence"), int)
+        or isinstance(payload.get("status"), bool)
+        or not isinstance(payload.get("status"), int)
+    ):
+        return error("goal result requires integer sequence and status", code="bad_goal_result")
+    if (
+        state.nav2_patrol_active_goal_sequence != payload["sequence"]
+        or not state.nav2_patrol.state()["patrolling"]
+    ):
+        return success({"ignored": True}, message="stale_patrol_goal_result")
+
+    if payload["status"] != 4:
+        waypoint = state.nav2_patrol.state()["waypoint_index"] + 1
+        message = f"Nav2 could not complete patrol waypoint {waypoint} (status {payload['status']})"
+        state.nav2_patrol.fail(message)
+        state.nav2_patrol_active_goal_sequence = 0
+        state.nav2_goal = None
+        state.nav2_cancel_sequence += 1
+        disarmed = _release_nav2_control(request)
+        state.nav2_mission_start = {"active": False, "stage": "failed", "message": message}
+        if not disarmed:
+            return error(f"{message}; STM32 disarm could not be confirmed", code="stm32_unavailable")
+        return success({"patrol": state.nav2_patrol.state()}, message="patrol_waypoint_failed")
+
+    next_goal = state.nav2_patrol.goal_succeeded()
+    if next_goal is None:
+        state.nav2_patrol_active_goal_sequence = 0
+        state.nav2_goal = None
+        state.nav2_cancel_sequence += 1
+        disarmed = _release_nav2_control(request)
+        message = state.nav2_patrol.state()["message"]
+        state.nav2_mission_start = {
+            "active": False,
+            "stage": "patrol_complete",
+            "message": message,
+        }
+        if not disarmed:
+            return error(f"{message}; STM32 disarm could not be confirmed", code="stm32_unavailable")
+        return success({"patrol": state.nav2_patrol.state()}, message="patrol_completed")
+
+    sequence = _queue_nav2_goal(state, next_goal)
+    state.nav2_patrol_active_goal_sequence = sequence
+    return success(
+        {"patrol": state.nav2_patrol.state(), "goal": state.nav2_goal},
+        message="next_patrol_waypoint",
+    )
+
+
+@router.post("/nav2/speed")
+async def nav2_set_speed(request: Request) -> dict[str, Any]:
+    """Set the maximum Nav2 translational speed, within the hardware limit."""
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise TypeError("speed settings must be an object")
+        value = payload["max_linear_speed_mps"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("speed must be a number")
+        speed = float(value)
+    except (KeyError, TypeError, ValueError):
+        return error("max_linear_speed_mps must be a number from 0.01 to 1.00", code="bad_speed")
+    if not math.isfinite(speed) or not 0.01 <= speed <= 1.00:
+        return error("max_linear_speed_mps must be from 0.01 to 1.00", code="bad_speed")
+    request.app.state.nav2_max_linear_speed_mps = speed
+    return success(
+        {"max_linear_speed_mps": speed},
+        message="Nav2 maximum linear speed updated",
     )
 
 
@@ -766,9 +1102,168 @@ async def nav2_stack_start(request: Request) -> dict[str, Any]:
     return success(process_state, message=message)
 
 
+@router.post("/nav2/mission/start")
+async def nav2_mission_start(request: Request) -> dict[str, Any]:
+    """Prepare Nav2 and SLAM, then arm for an operator-specified Nav2 goal."""
+    state = request.app.state
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise TypeError("mission options must be an object")
+    except (TypeError, ValueError):
+        return error("mission options must be a JSON object", code="bad_mission")
+
+    async with state.nav2_mission_lock:
+        if state.status.mode is RobotMode.ERROR or state.stm32.emergency_latched:
+            return error("emergency stop is latched — clear it first", code="emergency_latched")
+        if state.navigator.enabled or state.nav2_patrol.state()["recording"]:
+            return error(
+                "stop free roam or route recording before starting a Nav2 mission",
+                code="autonomous_mode_conflict",
+            )
+        if state.nav2_control_active or state.stm32.status.armed:
+            return error(
+                "Nav2 already owns the motor control; release it before starting another mission",
+                code="nav2_active",
+            )
+        if not state.config.simulation and not state.stm32.status.connected:
+            return error("STM32 is unavailable; autonomous mission was not started", code="stm32_unavailable")
+
+        readiness_checks: dict[str, bool] | None = None
+
+        def finish_failure(message: str, code: str) -> dict[str, Any]:
+            if state.nav2_control_active:
+                disarmed = _release_nav2_control(request)
+                state.status.update_speed(0.0, 0.0, 0.0)
+                if state.status.mode is RobotMode.AUTONOMOUS:
+                    state.status.set_mode(RobotMode.MANUAL)
+                    state.status.mission = "ready"
+                    state.status.ai_state = "standby"
+                if not disarmed:
+                    message = f"{message}; STM32 disarm could not be confirmed"
+                    code = "stm32_unavailable"
+            state.nav2_mission_start = {
+                "active": False,
+                "stage": "failed",
+                "message": message,
+                **({"readiness": readiness_checks} if readiness_checks is not None else {}),
+            }
+            return error(message, code=code)
+
+        state.nav2_mission_start = {"active": True, "stage": "starting_nav2"}
+        process_state = await asyncio.to_thread(state.nav2_process.state)
+        if not process_state["running"]:
+            started, message, _ = await asyncio.to_thread(state.nav2_process.start)
+            if not started:
+                return finish_failure(message, "nav2_start_failed")
+
+        process_state = await asyncio.to_thread(state.nav2_process.state)
+        if not process_state["slam_running"]:
+            state.nav2_mission_start = {"active": True, "stage": "starting_slam"}
+            map_received_before_start = state.ros_slam_map_received_at
+            started, message, _ = await asyncio.to_thread(state.nav2_process.start_slam)
+            if not started:
+                return finish_failure(message, "slam_start_failed")
+        else:
+            map_received_before_start = 0.0
+
+        state.nav2_mission_start = {"active": True, "stage": "waiting_for_map"}
+        deadline = time.monotonic() + NAV2_MISSION_MAP_TIMEOUT_S
+        while True:
+            process_state = await asyncio.to_thread(state.nav2_process.state)
+            if not process_state["running"] or not process_state["slam_running"]:
+                return finish_failure("Nav2 or SLAM stopped during startup", "nav2_start_failed")
+
+            map_is_fresh = state.config.simulation or (
+                state.ros_slam_map is not None
+                and state.ros_slam_map_received_at > map_received_before_start
+                and time.time() - state.ros_slam_map_received_at <= 5.0
+            )
+            lidar_is_ready = state.config.simulation or (
+                _fresh_physical_scan(state)
+            )
+            readiness_checks = {
+                "nav2": bool(process_state["running"]),
+                "slam": bool(process_state["slam_running"]),
+                "action_server": _nav2_action_is_ready(state),
+                "map": map_is_fresh,
+                "lidar": lidar_is_ready,
+            }
+            state.nav2_mission_start = {
+                "active": True,
+                "stage": "waiting_for_map",
+                "readiness": readiness_checks,
+            }
+            if all(readiness_checks.values()):
+                break
+            if time.monotonic() >= deadline:
+                waiting_for = []
+                if not readiness_checks["action_server"]:
+                    waiting_for.append("Active Nav2 action server")
+                if not readiness_checks["map"]:
+                    waiting_for.append("fresh ROS map")
+                if not readiness_checks["lidar"]:
+                    waiting_for.append("physical LiDAR scan")
+                return finish_failure(
+                    f"Autonomy startup timed out waiting for {', '.join(waiting_for)} after 90 seconds; motors remain disarmed",
+                    "autonomy_readiness_timeout",
+                )
+            await asyncio.sleep(NAV2_MISSION_POLL_INTERVAL_S)
+
+        state.nav2_mission_start = {"active": True, "stage": "claiming_control"}
+        claim_error = _claim_nav2_control(request)
+        if claim_error is not None:
+            state.nav2_mission_start = {
+                "active": False,
+                "stage": "failed",
+                "message": claim_error.get("message", "Could not claim Nav2 control"),
+            }
+            return claim_error
+
+        state.nav2_mission_start = {"active": True, "stage": "arming_motors"}
+        process_state = await asyncio.to_thread(state.nav2_process.state)
+        if not process_state["running"] or not process_state["slam_running"]:
+            return finish_failure("Nav2 or SLAM stopped before motor arming", "nav2_start_failed")
+        if not _nav2_action_is_ready(state):
+            return finish_failure(
+                "Nav2 NavigateToPose action server became unavailable; motors remain disarmed",
+                "nav2_not_ready",
+            )
+        if not state.config.simulation and (
+            state.ros_slam_map is None
+            or time.time() - state.ros_slam_map_received_at > 5.0
+            or not _fresh_physical_scan(state)
+        ):
+            return finish_failure(
+                "ROS map or physical LiDAR scan became unavailable; motors remain disarmed",
+                "autonomy_not_ready",
+            )
+        if not state.stm32.arm():
+            return finish_failure("STM32 is unavailable; motors were not armed", "stm32_unavailable")
+        state.status.set_mode(RobotMode.AUTONOMOUS)
+        state.status.mission = "nav2_goal_navigation"
+        state.status.ai_state = "awaiting_goal"
+        state.nav2_last_command_at = time.monotonic()
+        state.nav2_cancel_sequence += 1
+        state.nav2_goal = None
+        state.nav2_mission_start = {
+            "active": False,
+            "stage": "ready_for_goal",
+            "message": "Nav2 is ready; select a goal on the live map.",
+        }
+        result = {
+            "ready_for_goal": True,
+            "claimed": True,
+            "armed": True,
+        }
+        return success(result, message="Nav2 is ready for a goal")
+
+
 @router.post("/nav2/stack/stop")
 async def nav2_stack_stop(request: Request) -> dict[str, Any]:
     state = request.app.state
+    state.nav2_patrol.stop()
+    state.nav2_patrol_active_goal_sequence = 0
     if state.nav2_control_active:
         if not _release_nav2_control(request):
             return error(
@@ -791,6 +1286,8 @@ async def nav2_stack_stop(request: Request) -> dict[str, Any]:
 @router.post("/nav2/goal")
 async def nav2_goal(request: Request) -> dict[str, Any]:
     state = request.app.state
+    if state.nav2_patrol.state()["patrolling"]:
+        return error("stop route patrol before sending a manual Nav2 goal", code="patrol_active")
     if not state.nav2_process.state()["running"]:
         return error("start the Nav2 stack before sending a goal", code="nav2_not_running")
     if not state.nav2_control_active or not state.stm32.status.armed:
@@ -816,11 +1313,9 @@ async def nav2_goal(request: Request) -> dict[str, Any]:
         return error("goal requires finite x, y, and yaw values", code="bad_goal")
     if max(abs(x), abs(y)) > 20.0:
         return error("goal coordinates must be within 20 m of the map origin", code="goal_out_of_range")
-    state.nav2_goal_sequence += 1
-    state.nav2_cancel_sequence += 1
-    state.nav2_goal = {"x": x, "y": y, "yaw": math.atan2(math.sin(yaw), math.cos(yaw))}
+    sequence = _queue_nav2_goal(state, {"x": x, "y": y, "yaw": yaw})
     return success(
-        {"sequence": state.nav2_goal_sequence, "goal": state.nav2_goal},
+        {"sequence": sequence, "goal": state.nav2_goal},
         message="nav2_goal_queued",
     )
 
@@ -830,8 +1325,13 @@ async def nav2_cancel(request: Request) -> dict[str, Any]:
     state = request.app.state
     if not state.nav2_control_active:
         return error("Nav2 does not currently own control", code="nav2_not_claimed")
+    was_patrolling = state.nav2_patrol.state()["patrolling"]
     state.nav2_cancel_sequence += 1
     state.nav2_goal = None
+    state.nav2_patrol.stop()
+    state.nav2_patrol_active_goal_sequence = 0
+    if was_patrolling and not _release_nav2_control(request):
+        return error("patrol cancelled but STM32 disarm could not be confirmed", code="stm32_unavailable")
     return success({"cancel_sequence": state.nav2_cancel_sequence}, message="nav2_goal_cancelled")
 
 
@@ -839,23 +1339,40 @@ async def nav2_cancel(request: Request) -> dict[str, Any]:
 async def nav2_next_goal(request: Request, after: int = 0) -> dict[str, Any]:
     state = request.app.state
     goal = state.nav2_goal
+    data = {
+        "sequence": state.nav2_goal_sequence,
+        "cancel_sequence": state.nav2_cancel_sequence,
+        "control_claimed": bool(state.nav2_control_active),
+        "armed": bool(state.stm32.status.armed),
+    }
     if goal is None or state.nav2_goal_sequence <= after:
         return success(
             {
-                "sequence": state.nav2_goal_sequence,
-                "cancel_sequence": state.nav2_cancel_sequence,
                 "goal": None,
+                **data,
             },
             message="no_new_nav2_goal",
         )
     return success(
         {
-            "sequence": state.nav2_goal_sequence,
-            "cancel_sequence": state.nav2_cancel_sequence,
             "goal": goal,
+            **data,
         },
         message="nav2_goal",
     )
+
+
+@router.get("/nav2/odometry/command")
+async def nav2_odometry_command(request: Request) -> dict[str, Any]:
+    """Return a fresh manual setpoint for bridge open-loop odometry only."""
+    state = request.app.state
+    command = getattr(state, "manual_odom_command", {})
+    command_at = getattr(state, "manual_odom_command_at", 0.0)
+    is_manual = not state.nav2_control_active and state.status.mode is RobotMode.MANUAL
+    is_fresh = time.monotonic() - command_at <= 0.5
+    if not is_manual or not is_fresh:
+        command = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+    return success({"command": command}, message="manual_odometry_command")
 
 
 @router.post("/nav2/release")
@@ -898,8 +1415,9 @@ async def nav2_cmd_vel(request: Request) -> dict[str, Any]:
 
     vx, vy = values[:2]
     linear_speed = math.hypot(vx, vy)
-    if linear_speed > 0.10:
-        scale = 0.10 / linear_speed
+    max_linear_speed = min(1.00, state.nav2_max_linear_speed_mps)
+    if linear_speed > max_linear_speed:
+        scale = max_linear_speed / linear_speed
         vx *= scale
         vy *= scale
     wz = max(-0.25, min(0.25, values[2]))
@@ -972,6 +1490,37 @@ async def navigation_state(request: Request) -> dict[str, Any]:
     return success(_navigation_snapshot(request), message="navigation_state")
 
 
+@router.post("/navigation/roam/start")
+async def navigation_roam_start(request: Request) -> dict[str, Any]:
+    """Start the LiDAR-reactive free-roam mode without claiming Nav2 control."""
+    state = request.app.state
+    if state.status.mode is RobotMode.ERROR or state.stm32.emergency_latched:
+        return error("emergency stop is latched — clear it first", code="emergency_latched")
+    if state.nav2_control_active:
+        return error("release Nav2 control before starting free roam", code="nav2_active")
+    if state.nav2_patrol.state()["recording"] or state.nav2_patrol.state()["patrolling"]:
+        return error("stop route recording or patrol before starting free roam", code="patrol_active")
+    if not state.config.simulation and not state.stm32.status.connected:
+        return error("STM32 is unavailable; free roam was not started", code="stm32_unavailable")
+    if not state.config.simulation and not _fresh_physical_scan(state):
+        return error("a fresh physical LiDAR scan is required for free roam", code="lidar_unavailable")
+    if state.status.metadata.get("fire_alert"):
+        return error("free roam is unavailable while a fire alert is active", code="fire_alert_active")
+
+    navigator = _navigator(request)
+    navigator.enable()
+    if not state.config.simulation and not state.stm32.status.armed:
+        navigator.disable()
+        return error("STM32 could not be armed; free roam was not started", code="stm32_unavailable")
+    return success({"roam_enabled": True}, message="LiDAR free roam started")
+
+
+@router.post("/navigation/roam/stop")
+async def navigation_roam_stop(request: Request) -> dict[str, Any]:
+    _navigator(request).disable()
+    return success({"roam_enabled": False}, message="LiDAR free roam stopped")
+
+
 @router.post("/navigation/start")
 async def navigation_start(request: Request) -> dict[str, Any]:
     """Select Nav2 autonomous control without arming the motor controller."""
@@ -991,6 +1540,7 @@ async def navigation_stop(request: Request) -> dict[str, Any]:
                 code="stm32_unavailable",
             )
     _navigator(request).disable()
+    request.app.state.nav2_patrol.stop()
     return success({"claimed": False, "armed": False}, message="nav2_control_released")
 
 
@@ -1036,6 +1586,8 @@ async def emergency_stop(request: Request) -> dict[str, Any]:
     request.app.state.nav2_last_command_at = 0.0
     request.app.state.nav2_cancel_sequence += 1
     request.app.state.nav2_goal = None
+    request.app.state.nav2_patrol.stop()
+    request.app.state.nav2_patrol_active_goal_sequence = 0
     if hasattr(request.app.state, "stm32"):
         request.app.state.stm32.emergency_stop()
     request.app.state.status.set_mode(RobotMode.ERROR)

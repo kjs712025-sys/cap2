@@ -120,7 +120,7 @@ class FireMonitor:
 
     async def check_once(self) -> dict[str, object] | None:
         """Analyze one frame and warn or stop the robot based on confidence."""
-        frame = self.camera.read_frame()
+        frame = await asyncio.to_thread(self.camera.read_frame)
         if frame is None:
             return None
 

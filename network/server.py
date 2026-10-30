@@ -22,6 +22,7 @@ from lidar.lidar import LidarSensor
 from network.api import router as api_router
 from network.mqtt import MqttPublisher
 from network.nav2_process import Nav2Process
+from network.route_patrol import RoutePatrol
 from network.websocket import RobotSocketManager
 from robot.manual import ManualController
 from robot.navigation import AutonomousNavigator
@@ -36,6 +37,8 @@ from utils.logger import get_logger
 from utils.system_monitor import SystemMonitor
 
 logger = get_logger("network.server")
+
+_NAV2_HEARTBEAT_TIMEOUT_S = 1.0
 
 
 def create_app(config: RobotConfig) -> FastAPI:
@@ -151,7 +154,18 @@ def create_app(config: RobotConfig) -> FastAPI:
     app.state.nav2_goal_sequence = 0
     app.state.nav2_cancel_sequence = 0
     app.state.nav2_goal = None
+    app.state.nav2_max_linear_speed_mps = 1.00
+    app.state.nav2_action_ready = False
+    app.state.nav2_action_ready_at = 0.0
+    app.state.manual_odom_command = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+    app.state.manual_odom_command_at = 0.0
     app.state.nav2_process = Nav2Process(Path(__file__).resolve().parents[1])
+    app.state.nav2_patrol = RoutePatrol(app.state.nav2_process.maps_dir / "nav2_patrol_route.json")
+    app.state.nav2_patrol_active_goal_sequence = 0
+    app.state.nav2_mission_lock = asyncio.Lock()
+    app.state.nav2_mission_start = {"active": False, "stage": "idle"}
+    app.state.nav2_map_pose = None
+    app.state.nav2_map_pose_at = 0.0
     app.state.ros_slam_map = None
     app.state.ros_slam_map_received_at = 0.0
     stm32.initialize()
@@ -215,7 +229,7 @@ def create_app(config: RobotConfig) -> FastAPI:
             await asyncio.sleep(0.1)
             if (
                 app.state.nav2_control_active
-                and time.monotonic() - app.state.nav2_last_command_at > 0.5
+                and time.monotonic() - app.state.nav2_last_command_at > _NAV2_HEARTBEAT_TIMEOUT_S
             ):
                 logger.error("Nav2 command stream timed out; stopping and disarming STM32")
                 app.state.nav2_control_active = False
@@ -270,6 +284,10 @@ def create_app(config: RobotConfig) -> FastAPI:
             if task is not None:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+        if app.state.nav2_control_active:
+            if not stm32.disarm():
+                logger.error("Could not confirm STM32 disarm during application shutdown")
+            app.state.nav2_control_active = False
         navigator.disable()
         nav2_process = app.state.nav2_process
         nav2_process.stop_all()

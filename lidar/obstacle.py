@@ -81,9 +81,11 @@ class ObstacleDetector:
     def safe_direction(self, scan: list[ScanPoint]) -> str:
         """Pick the clearest heading: forward / left / right / backward / stop."""
         if not scan:
-            return "forward"
+            return "stop"
 
         sectors = self.sector_distances(scan)
+        if int(sectors["front"]["count"]) == 0:
+            return "stop"
 
         def clearance(name: str) -> float:
             value = sectors[name]["min_distance"]
